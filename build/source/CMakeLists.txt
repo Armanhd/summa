@@ -187,6 +187,7 @@ set(DRIVER
     ${DRIVER_DIR}/summa_modelRun.f90
     ${DRIVER_DIR}/summa_writeOutput.f90
     ${DRIVER_DIR}/summa_simulation.f90
+    ${DRIVER_DIR}/python_api/summa_python_api.f90
     ${DRIVER_DIR}/summa_spinup.f90
     CACHE INTERNAL "DRIVER")
 set(DRIVER_TOML

@@ -63,7 +63,7 @@ output=$3
 
 # ----- get the single SUMMA HRU ID -----
 
-summa_hru_id=$(ncks -H -C -s '%d\n' -v hruId "$forcing" || true)
+summa_hru_id=$(ncks -H -C -s '%.17g\n' -v hruId "$forcing" || true)
 
 if [[ $(printf "%s\n" "$summa_hru_id" | wc -l | tr -d ' ') -ne 1 ]]; then
     echo "ERROR: forcing file must contain exactly one hruId"
