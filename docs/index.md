@@ -22,6 +22,13 @@ The important modeling features are:
 SUMMA documentation is available [online](http://summa.readthedocs.io/) and remains a work in progress. Additional SUMMA information including publications, test data sets, and sample applications can be found on the [SUMMA web site](http://www.ral.ucar.edu/projects/summa) at NCAR.
 
 
+## Python wrapper and external calibration
+
+The `python-wrapper-v4.5` branch extends coupled SUMMA-mizuRoute with a Python interface for external calibration and optimization. The wrapper exposes SUMMA objective evaluation through `libsumma.so` and supports process-level parallel evaluation of independent parameter sets. A Pymoo-based calibration workflow is currently included.
+
+See the [Python wrapper documentation](python_wrapper/README.md) for an overview, implementation notes, and the step-by-step user guide.
+
+
 ## Building SUMMA
 
 SUMMA depends on NetCDF and LAPACK. Optional features pull in further dependencies, described below.
