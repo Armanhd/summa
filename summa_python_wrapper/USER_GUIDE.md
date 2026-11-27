@@ -17,13 +17,13 @@ The SUMMA Python wrapper provides a **simple, lightweight interface** that conne
 
 **Verified FIR software environment:** `StdEnv/2023`, `gcc/12.3`, `openmpi/4.1.5`, `netcdf/4.9.2`, `netcdf-fortran/4.6.1`, `cmake/3.31.0`, `openblas/0.3.24`, locally built SUNDIALS 7.3.0. Adapt module names to your system.
 
-
 ## 3. Download SUMMA and the Python wrapper
 
-The Python wrapper is installed alongside SUMMA. You need to download two repositories:
+The SUMMA Python wrapper is maintained within the SUMMA source repository on the `feature/python-wrapper` branch.
 
+This branch contains:
 1. **SUMMA:** The hydrological model and its native calibration routines.
-2. **SUMMA Python Wrapper:** The Python interface, optimization algorithms, and installation script.
+2. **SUMMA Python Wrapper:** The Python interface, optimization algorithms, Fortran API, and installation script, located in the `summa_python_wrapper/` directory.
 
 First, create a working directory:
 
@@ -32,22 +32,14 @@ mkdir -p ~/summa_workspace
 cd ~/summa_workspace
 ```
 
-Clone SUMMA and select the compatible development branch:
+Clone the SUMMA repository with the Python wrapper:
 
 ```bash
-git clone https://github.com/CH-Earth/summa.git summa
-cd summa
-git checkout develop
-cd ..
+git clone --branch feature/python-wrapper \
+  https://github.com/Armanhd/summa.git summa
 ```
 
-Clone the Python wrapper:
-
-```bash
-git clone https://github.com/Armanhd/summa_python_wrapper.git
-```
-
-**Note:** The wrapper repository URL is proposed and should be updated once the repository is published. Use a verified compatible SUMMA revision; the latest `develop` commit is not automatically guaranteed to work.
+**Note:** The `feature/python-wrapper` branch contains the Python wrapper together with the SUMMA source code. It is based on the upstream SUMMA `develop` branch. The wrapper integration with this revision should be compiled and tested before production use.
 
 Create a separate directory for compiling SUMMA:
 
@@ -59,23 +51,28 @@ Your directory structure should now look like this:
 
 ```text
 summa_workspace/
-├── summa/                 # SUMMA source code
-├── summa_python_wrapper/  # Python wrapper source code
+├── summa/                       # SUMMA source code
+│   ├── summa_python_wrapper/    # Python wrapper source code
+│   │   ├── fortran_api/
+│   │   ├── python_wrapper/
+│   │   └── install_wrapper.py
+│   └── ...
 └── build/
-    └── summa_python/      # Compilation directory
+    └── summa_python/            # Compilation directory
 ```
 
 Finally, define the paths used throughout this guide:
 
 ```bash
 export SUMMA="$HOME/summa_workspace/summa"
-export WRAPPER="$HOME/summa_workspace/summa_python_wrapper"
+export WRAPPER="$SUMMA/summa_python_wrapper"
 export BUILD="$HOME/summa_workspace/build/summa_python"
 ```
 
 These paths will be used in the following steps to install the Python interface, compile `libsumma.so`, and run calibration.
 
 **Do not compile SUMMA yet.** The next section explains how to install the Fortran API into the SUMMA source tree before building the shared library.
+
 
 
 ## 4. Load model libraries and Python environment
