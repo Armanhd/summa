@@ -64,7 +64,8 @@ USE mDecisions_module,only:      &
  ! look-up values for choice of boundary conditions for thermodynamics
  prescribedTemp,                 &  ! prescribed temperature
  energyFlux,                     &  ! energy flux
- zeroFlux                           ! zero flux
+ zeroFlux,                       &  ! zero flux
+ prescribedFlux                     ! prescribed flux (geothermal heat flux at the base of the soil)
 ! -------------------------------------------------------------------------------------------------
 implicit none
 private
@@ -104,16 +105,20 @@ subroutine snowLakeSoilGlceNrgFlux(&
   ! local variables
   integer(i4b)                        :: nLayers                    ! number of model layers
   integer(i4b)                        :: iLayer                     ! index of model layers
-  integer(i4b)                        :: ixLayerDesired(1)          ! layer desired (scalar solution)
   integer(i4b)                        :: ixTop                      ! top layer in subroutine call
   integer(i4b)                        :: ixBot                      ! bottom layer in subroutine call
   real(rkind)                         :: qFlux                      ! liquid flux at layer interfaces (m s-1)
   real(rkind)                         :: dz                         ! height difference (m)
   logical(lgt)                        :: zeroFlux_noThetaBdry       ! flag to denote if zero flux at noThetaChange boundary
   ! ------------------------------------------------------------------------------------------------------------------------------------------------------
-  ! allocate intent(out) data structure components
+  ! allocate intent(out) data structure components, reused unless the number of layers changed
   nLayers=indx_data%var(iLookINDEX%nLayers)%dat(1)
-  allocate(&
+  if(allocated(out_snowLakeSoilGlceNrgFlux % iLayerNrgFlux))then
+    if(ubound(out_snowLakeSoilGlceNrgFlux % iLayerNrgFlux,1)/=nLayers) &
+      deallocate(out_snowLakeSoilGlceNrgFlux % iLayerNrgFlux, out_snowLakeSoilGlceNrgFlux % dNrgFlux_dTempAbove, out_snowLakeSoilGlceNrgFlux % dNrgFlux_dTempBelow, &
+                 out_snowLakeSoilGlceNrgFlux % dNrgFlux_dWatAbove, out_snowLakeSoilGlceNrgFlux % dNrgFlux_dWatBelow)
+  end if
+  if(.not.allocated(out_snowLakeSoilGlceNrgFlux % iLayerNrgFlux)) allocate(&
     out_snowLakeSoilGlceNrgFlux % iLayerNrgFlux(0:nLayers),                          & ! energy flux at the layer interfaces (W m-2)
     out_snowLakeSoilGlceNrgFlux % dNrgFlux_dTempAbove(0:nLayers),                    & ! derivatives in the flux w.r.t. temperature in the layer above (J m-2 s-1 K-1)
     out_snowLakeSoilGlceNrgFlux % dNrgFlux_dTempBelow(0:nLayers),                    & ! derivatives in the flux w.r.t. temperature in the layer below (J m-2 s-1 K-1)
@@ -155,10 +160,12 @@ subroutine snowLakeSoilGlceNrgFlux(&
     ! input: thermal properties
     upperBoundTemp          => mpar_data%var(iLookPARAM%upperBoundTemp)%dat(1),      & ! intent(in):  temperature of the upper boundary (K)
     lowerBoundTemp          => mpar_data%var(iLookPARAM%lowerBoundTemp)%dat(1),      & ! intent(in):  temperature of the lower boundary (K)
+    lowerBoundNrgFlux       => mpar_data%var(iLookPARAM%lowerBoundNrgFlux)%dat(1),   & ! intent(in):  energy flux at the lower boundary, the geothermal heat flux (W m-2)
     iLayerThermalC          => diag_data%var(iLookDIAG%iLayerThermalC)%dat,          & ! intent(in):  thermal conductivity at the interface of each layer (W m-1 K-1)
     ! output: diagnostic fluxes
     iLayerConductiveFlux => flux_data%var(iLookFLUX%iLayerConductiveFlux)%dat,       & ! intent(out): conductive energy flux at layer interfaces at end of time step (W m-2)
     iLayerAdvectiveFlux  => flux_data%var(iLookFLUX%iLayerAdvectiveFlux)%dat,        & ! intent(out): advective energy flux at layer interfaces at end of time step (W m-2)
+    scalarLowerBoundNrgFlux => flux_data%var(iLookFLUX%scalarLowerBoundNrgFlux)%dat(1), & ! intent(out): conductive energy flux across the lower boundary, positive down (W m-2)
     ! output: fluxes and derivatives at all layer interfaces
     iLayerNrgFlux        => out_snowLakeSoilGlceNrgFlux % iLayerNrgFlux,          & ! intent(out): energy flux at the layer interfaces (W m-2)
     dFlux_dTempAbove     => out_snowLakeSoilGlceNrgFlux % dNrgFlux_dTempAbove,    & ! intent(out): derivatives in the flux w.r.t. temperature in the layer above (J m-2 s-1 K-1)
@@ -173,15 +180,14 @@ subroutine snowLakeSoilGlceNrgFlux(&
     ! initialize error control
     err=0; message='snowLakeSoilGlceNrgFlux/'
 
-    ! set conductive and advective fluxes to missing in the upper boundary
+    ! conductive flux is missing at the upper boundary
     iLayerConductiveFlux(0) = realMissing
-    iLayerAdvectiveFlux(0)  = realMissing  !included in the ground heat flux
+    iLayerAdvectiveFlux(:)  = 0._rkind     ! set in the soil once the soil water fluxes are known
 
     ! get the indices for the layers
     if (scalarSolution) then
-      ixLayerDesired = pack(ixLayerState, ixSnLaSoGlNrg/=integerMissing)
-      ixTop = ixLayerDesired(1)
-      ixBot = ixLayerDesired(1)
+      ixTop = ixLayerState(findloc(ixSnLaSoGlNrg/=integerMissing, .true., 1)) ! first layer with an energy state in the subset
+      ixBot = ixTop
     else
       ixTop = 1
       ixBot = nLayers
@@ -202,39 +208,25 @@ subroutine snowLakeSoilGlceNrgFlux(&
         select case(ix_bcLowrTdyn) ! identify the lower boundary condition for thermodynamics
           case(prescribedTemp); iLayerConductiveFlux(iLayer) = -iLayerThermalC(iLayer)*(lowerBoundTemp - mLayerTempTrial(iLayer))/(mLayerDepth(iLayer)*0.5_rkind)
           case(zeroFlux);       iLayerConductiveFlux(iLayer) = 0._rkind
+          ! geothermal heat enters from below, so it is negative here, and only under a soil column
+          case(prescribedFlux)
+            if(layerType(iLayer)==iname_soil)then
+              iLayerConductiveFlux(iLayer) = -lowerBoundNrgFlux
+            else
+              iLayerConductiveFlux(iLayer) = 0._rkind
+            end if
         end select  ! identifying the lower boundary condition for thermodynamics
       else ! domain boundary fluxes -- positive downwards
         iLayerConductiveFlux(iLayer)  = -iLayerThermalC(iLayer)*(mLayerTempTrial(iLayer+1) - mLayerTempTrial(iLayer)) / &
                                         (mLayerHeight(iLayer+1) - mLayerHeight(iLayer))
       end if ! the type of layer
     end do  ! end looping through layers
-
-    ! -------------------------------------------------------------------------------------------------------------------------
-    ! ***** compute the advective fluxes at layer interfaces *****
-    ! -------------------------------------------------------------------------------------------------------------------------
-    do iLayer=ixTop,ixBot
-      select case(layerType(iLayer)) ! get the liquid flux at layer interfaces
-        case(iname_snow,iname_lake,iname_glce); qFlux = iLayerLiqFluxSnLaGl(iLayer)
-        case(iname_soil);                       qFlux = iLayerLiqFluxSoil(iLayer-nSnow-nLake)
-        case default; err=20; message=trim(message)//'unable to identify layer type'; return
-      end select
-      ! surface ice melt, propagates upwards and if above layer not coupled, two fluxes here
-      if(mLayerTempTrial(iLayer)<=Tfreeze) then ! can't be unfrozen lake
-        if ((iLayer==nSnow+nLake+nSoil+1 .and. nSoil==0) .or. (iLayer==nSnow+nLake+1 .and. nLake>0)) qFlux = scalarSurfaceIceMelt
-      end if
-      if(iLayer==nLayers-noThetaChange .and. zeroFlux_noThetaBdry)then
-        iLayerAdvectiveFlux(iLayer) = 0._rkind ! all melt energy absorbed in top layers of glacier ice
-      elseif(iLayer==nLayers) then ! compute fluxes at the lower boundary -- positive downwards
-        iLayerAdvectiveFlux(iLayer) = -Cp_water*iden_water*qFlux*(lowerBoundTemp - mLayerTempTrial(iLayer))
-      else ! compute fluxes within the domain -- positive downwards
-        iLayerAdvectiveFlux(iLayer) = -Cp_water*iden_water*qFlux*(mLayerTempTrial(iLayer+1) - mLayerTempTrial(iLayer))
-      end if
-    end do  ! end looping through layers
+    if(ixBot==nLayers) scalarLowerBoundNrgFlux = iLayerConductiveFlux(nLayers)
 
     ! -------------------------------------------------------------------------------------------------------------------------
     ! ***** compute the total fluxes at layer interfaces *****
     ! -------------------------------------------------------------------------------------------------------------------------
-    ! NOTE: ignore advective fluxes for now
+    ! NOTE: heat carried by water is added in computFlux once the water fluxes are known; meltwater in snow and ice is at freezing and carries none
     iLayerNrgFlux(0)           = groundNetFlux ! from vegNrgFlux module
     iLayerNrgFlux(ixTop:ixBot) = iLayerConductiveFlux(ixTop:ixBot)
 
@@ -290,7 +282,7 @@ subroutine snowLakeSoilGlceNrgFlux(&
             dz = mLayerDepth(iLayer)*0.5_rkind
             dFlux_dWatAbove(iLayer)  = -dThermalC_dWatAbove(iLayer) * ( lowerBoundTemp - mLayerTempTrial(iLayer) )/dz
             dFlux_dTempAbove(iLayer) = -dThermalC_dTempAbove(iLayer) * ( lowerBoundTemp - mLayerTempTrial(iLayer) )/dz + iLayerThermalC(iLayer)/dz
-          case(zeroFlux)  ! zero flux at the lower boundary
+          case(zeroFlux,prescribedFlux)  ! zero flux, or a prescribed (geothermal) flux: neither depends on the state
             dFlux_dWatAbove(iLayer) = 0._rkind
             dFlux_dTempAbove(iLayer) = 0._rkind
           case default; err=20; message=trim(message)//'unable to identify lower boundary condition for thermodynamics'; return

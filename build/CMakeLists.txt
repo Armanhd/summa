@@ -28,6 +28,8 @@ set(CMAKE_CONFIGURATION_TYPES Release Debug)
 option(USE_MIZUROUTE "Enable mizuRoute coupling" OFF)
 option(USE_SUNDIALS "Use IDA solver from SUNDIALS suite" OFF)
 option(USE_NEXTGEN "Use NextGen Framework" OFF)
+option(USE_NGEN_FORCING "Use framework-supplied forcing when USE_NEXTGEN=ON" ON)
+option(USE_NGEN_OUTPUT "Use framework-managed output when USE_NEXTGEN=ON" ON)
 option(USE_OPENWQ "Use OpenWQ Framework" OFF)
 option(USE_MPI "Use MPI parallelization" OFF)
 option(USE_TOML "Build the TOML configuration reader (needed for -c)" OFF)
@@ -41,15 +43,27 @@ if (USE_MIZUROUTE OR USE_MPI)
 endif()
 set(EXT_TARGETS) # list of external targets to link to
 
-# Set top-level directory
-if (USE_NEXTGEN)
+# Support both a direct checkout and the standard NextGen wrapper layout
+if (USE_NEXTGEN AND
+    EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/summa/build/CMakeLists.txt")
     set(F_MASTER "${CMAKE_CURRENT_SOURCE_DIR}/summa")
 else()
     set(F_MASTER "${CMAKE_CURRENT_SOURCE_DIR}/..")
 endif()
 
 set(PARENT_DIR "${F_MASTER}")
-set(EXEC_DIR "${F_MASTER}/bin")
+set(EXEC_DIR "${F_MASTER}/bin" CACHE PATH "Directory for SUMMA executables")
+
+# Define directories that contains source code
+set(DRIVER_DIR ${F_MASTER}/build/source/driver)
+set(OBJFNC_DIR ${F_MASTER}/build/source/objfunc)
+set(DSHARE_DIR ${F_MASTER}/build/source/dshare)
+set(ENGINE_DIR ${F_MASTER}/build/source/engine)
+set(HOOKUP_DIR ${F_MASTER}/build/source/hookup)
+set(NETCDF_DIR ${F_MASTER}/build/source/netcdf)
+set(NOAHMP_DIR ${F_MASTER}/build/source/noah-mp)
+set(NUMREC_DIR ${F_MASTER}/build/source/numrec)
+set(PARALLEL_DIR ${F_MASTER}/build/source/parallel)
 
 # Handle optional external libraries
 
@@ -65,9 +79,17 @@ endif()
 # NextGen
 if (USE_NEXTGEN)
     message("ENABLING NEXTGEN")
-    add_compile_definitions(NGEN_ACTIVE NGEN_FORCING_ACTIVE
-                            NGEN_OUTPUT_ACTIVE)
-    add_subdirectory(../iso_c_fortran_bmi ${CMAKE_BINARY_DIR}/iso_c_bmi)
+    add_compile_definitions(NGEN_ACTIVE)
+    if (USE_NGEN_FORCING)
+        add_compile_definitions(NGEN_FORCING_ACTIVE)
+    endif()
+    if (USE_NGEN_OUTPUT)
+        add_compile_definitions(NGEN_OUTPUT_ACTIVE)
+    endif()
+    set(SUMMA_ISO_C_FORTRAN_BMI_ROOT
+        "${CMAKE_CURRENT_SOURCE_DIR}/../iso_c_fortran_bmi"
+        CACHE PATH "Path to iso_c_fortran_bmi source")
+    add_subdirectory("${SUMMA_ISO_C_FORTRAN_BMI_ROOT}" "${CMAKE_BINARY_DIR}/iso_c_bmi")
     list(INSERT CMAKE_MODULE_PATH 0 "${F_MASTER}/build/cmake/")
     list(INSERT CMAKE_PREFIX_PATH 0 "${F_MASTER}/build/cmake/")
     set(CMAKE_Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/fortran)
@@ -91,8 +113,8 @@ if (USE_MPI)
     find_package(MPI REQUIRED COMPONENTS Fortran)
 
     add_library(PARALLEL_UTILS STATIC
-        source/parallel/mpi_context.f90
-        source/parallel/error_utils.f90
+        ${PARALLEL_DIR}/mpi_context.f90
+        ${PARALLEL_DIR}/error_utils.f90
     )
 
     target_link_libraries(PARALLEL_UTILS PUBLIC
@@ -131,6 +153,11 @@ if (USE_MIZUROUTE)
 
     include(${SUMMA_MIZU_DIR}/CMakeLists.txt)
 endif()
+
+# Calibration
+message("CONFIGURING CALIBRATION")
+set(CALIBR_DIR ${F_MASTER}/build/source/calibration)
+include(${CALIBR_DIR}/CMakeLists.txt)
 
 # Executable names
 #
@@ -214,35 +241,19 @@ if(CMAKE_Fortran_COMPILER_ID STREQUAL "GNU")
     list(APPEND FLAGS_ALL -ffpe-summary=none)
 endif()
 
-#=========================================================================================
-# COMPILE PART 1: Define directory paths
-#=========================================================================================
+# Use the configured Fortran options for mizuRoute and its coupling layers.
+set(FLAGS_MIZU ${FLAGS_ALL})
 
-# Define directories that contains source code
-set(DRIVER_DIR ${F_MASTER}/build/source/driver)
-set(OBJFNC_DIR ${F_MASTER}/build/source/objfunc)
-set(DSHARE_DIR ${F_MASTER}/build/source/dshare)
-set(CALIBR_DIR ${F_MASTER}/build/source/calibration)
-set(ENGINE_DIR ${F_MASTER}/build/source/engine)
-set(HOOKUP_DIR ${F_MASTER}/build/source/hookup)
-set(NETCDF_DIR ${F_MASTER}/build/source/netcdf)
-set(NOAHMP_DIR ${F_MASTER}/build/source/noah-mp)
-set(NUMREC_DIR ${F_MASTER}/build/source/numrec)
-
-#=========================================================================================
-# COMPILE PART 2: Assemble all of the SUMMA sub-routines
-#=========================================================================================
+# Assemble all of the SUMMA sub-routines
 
 # SUMMA Source Files are defined in the CMakeLists.txt file in the subdirectory
-add_subdirectory(${F_MASTER}/build/source/)
+add_subdirectory("${F_MASTER}/build/source" "${CMAKE_BINARY_DIR}/source")
 
 # Noah-MP files use free-form syntax even though they use .F extension.
 set_source_files_properties(${NOAHMP} PROPERTIES Fortran_FORMAT FREE)
 
 
-#=========================================================================================
-# COMPILE PART 3: Collect the subroutines into build groups depending on build type
-#=========================================================================================
+# Collect the subroutines into build groups depending on build type
 
 set(COMM_ALL ${NRPROC} ${HOOKUP} ${DATAMS} ${UTILMS})
 set(SUMMA_ALL ${NETCDF} ${PRELIM} ${MODRUN} ${SOLVER} ${OBJFNC} ${CALIBR} ${DRIVER})
@@ -287,7 +298,7 @@ if (USE_MIZUROUTE)
 
     # mizuRoute type and interface definitions
     add_library(MIZUROUTE_TYPES STATIC ${MIZU_TYPE})
-    target_compile_options(MIZUROUTE_TYPES PRIVATE ${FLAGS_ALL})
+    target_compile_options(MIZUROUTE_TYPES PRIVATE ${FLAGS_MIZU})
     target_link_libraries(MIZUROUTE_TYPES PUBLIC SUMMA_NRTYPE)
     set_target_properties(MIZUROUTE_TYPES PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mizuroute_types_mod)
     target_include_directories(MIZUROUTE_TYPES PUBLIC ${CMAKE_BINARY_DIR}/mizuroute_types_mod)
@@ -295,13 +306,13 @@ if (USE_MIZUROUTE)
     # Core mizuRoute implementation
     add_library(MIZUROUTE STATIC ${MIZU_BASE} ${MIZU_SHIM} ${MIZU_TOPO}
       ${MIZU_INIT} ${MIZU_RMAP} ${MIZU_ROUTE} ${MIZU_OUTPUT})
-    target_compile_options(MIZUROUTE PRIVATE ${FLAGS_ALL})
+    target_compile_options(MIZUROUTE PRIVATE ${FLAGS_MIZU})
     target_link_libraries(MIZUROUTE PUBLIC MIZUROUTE_TYPES NetCDF::NetCDF)
     set_target_properties(MIZUROUTE PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mizuroute_mod)
 
     # SUMMA-facing mizuRoute coupling layer
     add_library(MIZUROUTE_COUPLING STATIC ${MIZU_COUPLING})
-    target_compile_options(MIZUROUTE_COUPLING PRIVATE ${FLAGS_ALL})
+    target_compile_options(MIZUROUTE_COUPLING PRIVATE ${FLAGS_MIZU})
     target_link_libraries(MIZUROUTE_COUPLING PUBLIC MIZUROUTE)
     add_dependencies(MIZUROUTE_COUPLING SUMMA_TYPES toml-f-lib)
     set_target_properties(MIZUROUTE_COUPLING PROPERTIES Fortran_MODULE_DIRECTORY ${CMAKE_BINARY_DIR}/mizuroute_coupling_mod)
@@ -324,6 +335,7 @@ endif()
 set(VERSIONFILE     ${DRIVER_DIR}/summaversion.inc)
 execute_process(
     COMMAND bash -c "git tag | tail -n 1"
+    WORKING_DIRECTORY "${F_MASTER}"
     OUTPUT_VARIABLE VERSION
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
@@ -334,18 +346,18 @@ execute_process(
 )
 execute_process(
     COMMAND bash -c "git describe --long --all --always | sed 's#heads/##'"
+    WORKING_DIRECTORY "${F_MASTER}"
     OUTPUT_VARIABLE GITBRCH
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 execute_process(
     COMMAND git rev-parse HEAD
+    WORKING_DIRECTORY "${F_MASTER}"
     OUTPUT_VARIABLE GITHASH
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
-#=========================================================================================
-# COMPILE PART 4: Do the compilation
-#=========================================================================================
+# Do the compilation
 
 # update version information
 file(WRITE  ${VERSIONFILE} "character(len=64), parameter     :: summaVersion = '${VERSION}'\n")
@@ -397,7 +409,8 @@ if(USE_NEXTGEN)
 	install(TARGETS summabmi
                 LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
                 PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-	configure_file(summabmi.pc.in summabmi.pc @ONLY)
+	configure_file("${F_MASTER}/build/cmake/summabmi.pc.in"
+        "${CMAKE_BINARY_DIR}/summabmi.pc" @ONLY)
 	install(FILES ${CMAKE_BINARY_DIR}/summabmi.pc DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/pkgconfig)
 
 else()
@@ -433,7 +446,7 @@ else()
 
   # Parallel optimization SUMMA executable
   if (USE_MPI)
-    add_executable(${EXEC_NAME_OPT} ${CALIBR_MPI} ${MAIN_SUMMA_OPT})
+    add_executable(${EXEC_NAME_OPT} ${CALIBR_MPI} ${DRIVER_OPT} ${MAIN_SUMMA_OPT})
     target_compile_options(${EXEC_NAME_OPT} PRIVATE ${FLAGS_ALL})
     set_property(TARGET ${EXEC_NAME_OPT} PROPERTY LINKER_LANGUAGE Fortran)
     target_link_libraries(${EXEC_NAME_OPT} PRIVATE summa PARALLEL_UTILS)

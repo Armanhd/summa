@@ -62,12 +62,13 @@ USE mDecisions_module,only:  &
 implicit none
 private
 public::derivforce
+public::calcPotentialEvap_Oudin2005
 contains
 
  ! ************************************************************************************************
  ! public subroutine derivforce: compute derived forcing data
  ! ************************************************************************************************
- subroutine derivforce(is_glac, forc_data,attr_data,mpar_data, prog_data,diag_data,flux_data,tmZoneOffsetFracDay,err,message)
+ subroutine derivforce(is_glac, has_canopy, forc_data,attr_data,mpar_data, prog_data,diag_data,flux_data,tmZoneOffsetFracDay,err,message)
  USE sunGeomtry_module,only:clrsky_rad                            ! compute cosine of the solar zenith angle
  USE convert_funcs_module,only:vapPress                           ! compute vapor pressure of air (Pa)
  USE convert_funcs_module,only:SPHM2RELHM,RELHM2SPHM,WETBULBTMP   ! conversion functions
@@ -79,6 +80,7 @@ contains
  implicit none
  ! input variables
  logical(lgt),intent(in)              :: is_glac                       ! flag to indicate if is a glacier domain
+ logical(lgt),intent(in)              :: has_canopy                    ! flag to indicate if the domain can have a vegetation canopy
  type(var_d),intent(inout)            :: forc_data                     ! vector of forcing data for a given time step
  type(var_d),intent(in)               :: attr_data                     ! vector of model attributes
  type(var_dlength),intent(in)         :: mpar_data                     ! vector of model parameters
@@ -106,6 +108,7 @@ contains
  real(rkind),parameter                :: co2Factor=355.e-6_rkind       ! empirical factor to obtain partial pressure of co2
  real(rkind),parameter                :: o2Factor=0.209_rkind          ! empirical factor to obtain partial pressure of o2
  real(rkind),parameter                :: minMeasHeight=1._rkind        ! minimum measurement height (m)
+ real(rkind),parameter                :: bareMeasHeight=2._rkind       ! measurement height over a domain without a canopy (m), that of the on-ice air the glacier factors give at Gulkana Site B
  real(rkind)                          :: relhum                        ! relative humidity (-)
  real(rkind)                          :: fracrain                      ! fraction of precipitation that falls as rain
  real(rkind)                          :: maxFrozenSnowTemp             ! maximum temperature of snow when the snow is predominantely frozen (K)
@@ -118,7 +121,10 @@ contains
  real(rkind),parameter                :: andersonDenScal=1.5_rkind     ! Scalar parameter in Anderson (1976) new snow density function (-)
  real(rkind),parameter                :: pahautDenWindScal=0.5_rkind   ! Scalar parameter for wind impacts on density using Pahaut (1976) function (-)
  real(rkind)                          :: airpres_base                  ! air pressure at the base elevation (Pa)
- real(rkind),parameter                :: lapseRate=0.006871_rkind      ! lapse rate (K m-1), 6.5C/1km is the standard environmental lapse rate
+ real(rkind)                          :: katabaticCooling              ! air temperature removed by the glacier surface layer (K)
+ real(rkind)                          :: airtempHRU                    ! air temperature at the HRU elevation (K)
+ real(rkind)                          :: airpresHRU                    ! air pressure at the HRU elevation (Pa)
+ real(rkind)                          :: airtempDOM                    ! air temperature lapsed to the domain elevation, before katabatic cooling (K)
  ! ************************************************************************************************
  ! associate local variables with the information in the data structures
  associate(&
@@ -140,8 +146,10 @@ contains
  newSnowDenMultWind      => mpar_data%var(iLookPARAM%newSnowDenMultWind)%dat(1)   , & ! Pahaut 1976, multiplier for new snow density applied to wind speed (kg m-7/2 s-1/2)
  newSnowDenMultAnd       => mpar_data%var(iLookPARAM%newSnowDenMultAnd)%dat(1)    , & ! Anderson 1976, multiplier for new snow density for Anderson function (K-1)
  newSnowDenBase          => mpar_data%var(iLookPARAM%newSnowDenBase)%dat(1)       , & ! Anderson 1976, base value that is rasied to the (3/2) power (K)
- glacierWindFactor       => mpar_data%var(iLookPARAM%glacierWindFactor)%dat(1)    , & ! wind speed increase to account for glacier katabatic wind profile (-)
- glacierTempReduction    => mpar_data%var(iLookPARAM%glacierTempReduction)%dat(1) , & ! air temperature decrease to account for down-glacier katabatic wind (-)
+ glacierWindFactor       => mpar_data%var(iLookPARAM%glacierWindFactor)%dat(1)    , & ! wind speed factor to account for glacier sheltering and katabatic wind profile (-)
+ glacierTempReduction    => mpar_data%var(iLookPARAM%glacierTempReduction)%dat(1) , & ! air temperature factor decrease to account for down-glacier katabatic wind (-)
+ precipElevGrad          => mpar_data%var(iLookPARAM%precipElevGrad)%dat(1)       , & ! fractional change in precipitation per metre above the HRU elevation (m-1)
+ tempLapseRate           => mpar_data%var(iLookPARAM%tempLapseRate)%dat(1)        , & ! air temperature decrease per metre above the HRU elevation (K m-1)
  ! radiation geometry variables
  latitude                => attr_data%var(iLookATTR%latitude)                     , & ! latitude (degrees north)
  longitude               => attr_data%var(iLookATTR%longitude)                    , & ! longitude (degrees east)
@@ -160,6 +168,7 @@ contains
  secondsSinceRefTime     => forc_data%var(iLookFORCE%time)                        , & ! time = seconds since reference time
  ! model forcing data
  SWRadAtm                => forc_data%var(iLookFORCE%SWRadAtm)                    , & ! downward shortwave radiation (W m-2)
+ LWRadAtm                => forc_data%var(iLookFORCE%LWRadAtm)                    , & ! downward longwave radiation (W m-2)
  airtemp                 => forc_data%var(iLookFORCE%airtemp)                     , & ! air temperature at 2 meter height (K)
  windspd                 => forc_data%var(iLookFORCE%windspd)                     , & ! wind speed at 10 meter height (m s-1)
  airpres                 => forc_data%var(iLookFORCE%airpres)                     , & ! air pressure at 2 meter height (Pa)
@@ -186,26 +195,48 @@ contains
  ! initialize error control
  err=0; message="derivforce/"
 
+ ! the forcing as given, at the HRU elevation
+ airtempHRU = airtemp
+ airpresHRU = airpres
+
  ! NGEN wants the wind inputted as two components, if not inputting NGEN forcing let the y direction be 0
  if(ngen_forcing_active)then
    windspd = sqrt(windspd_x**2_i4b + windspd_y**2_i4b)
  else
    windspd_x = windspd
    windspd_y = 0._rkind
-   if(windspd_x < minwind) windspd_x=minwind ! ensure wind speed is above a prescribed minimum value
  endif
- if(windspd < minwind) windspd=minwind ! ensure wind speed is above a prescribed minimum value
-
-
+ 
  ! adjust wind speed and air temperature for glacier katabatic winds, should be related to fetch length
  ! NOTE: Eventually want to have a separate katabatic wind model, but this is a simple first-order approach 
  ! see e.g. Radic et al., 2017, https://doi.org/10.5194/tc-11-2897-2017, following Oerlemans and Grisogono (2002)
  ! NOTE2: Should make dependent on the glacier geometry so wind speed increases and temperature decreases are larger down-glacier
- if (is_glac .and. airtemp>Tfreeze) then 
+ katabaticCooling = 0._rkind
+ if (is_glac) then
   windspd   = windspd   * glacierWindFactor
   windspd_x = windspd_x * glacierWindFactor
   windspd_y = windspd_y * glacierWindFactor
-  airtemp   = airtemp   - glacierTempReduction
+  if (airtemp>Tfreeze) then
+   katabaticCooling = (1._rkind - glacierTempReduction)*(airtemp - Tfreeze)
+   airtemp = airtemp - katabaticCooling
+  endif
+ endif
+
+ ! ensure wind speed is above a prescribed minimum value
+ if(windspd < minwind) then
+   if(ngen_forcing_active)then
+     if (windspd .ne. 0) then
+       windspd_x = windspd_x * (minwind/windspd)
+       windspd_y = windspd_y * (minwind/windspd)
+     else
+       windspd_x = minwind
+       windspd_y = 0._rkind
+     endif
+   else
+     windspd_x = minwind
+     windspd_y = 0._rkind
+   endif
+   windspd=minwind 
  endif
 
  ! check spectral dimension
@@ -214,18 +245,17 @@ contains
   err=20; return
  end if
 
- ! adjust the measurement height for the vegetation canopy
- ! NOTE: could return an error or a warning
- ! NOTE: this does not need to be done every time step -- doing here for consistency with the snow adjustment
- if(mHeight < heightCanopyTop)then
-  adjMeasHeight = heightCanopyTop+minMeasHeight  ! measurement height at least minMeasHeight above the canopy
+ ! Ensure measurement height is above the snow surface
+ ! a domain without a canopy (glacier, wetland, stream) takes screen-level air, not the HRU's height above its vegetation
+ if (.not. has_canopy) then
+  adjMeasHeight = max(bareMeasHeight, scalarSnowDepth + minMeasHeight)
  else
-  adjMeasHeight = mHeight
+  adjMeasHeight = max(mHeight, scalarSnowDepth + minMeasHeight)
  endif
-
- ! adjust the measurement height for snow depth
- if(adjMeasHeight < scalarSnowDepth+minMeasHeight)then
-  adjMeasHeight = scalarSnowDepth+minMeasHeight  ! measurement height at least minMeasHeight above the snow surface
+ 
+ ! Ensure measurement height is above the vegetation canopy
+ if(has_canopy)then
+   adjMeasHeight = max(adjMeasHeight, heightCanopyTop + minMeasHeight)
  endif
  
  ! Air pressure is assumed to be at the HRU mean elevation, so adjust to the domain mean elevation.
@@ -302,7 +332,15 @@ contains
  spectralIncomingDiffuse(2) = SWRadAtm*(1._rkind - scalarFractionDirect)*(1._rkind - Frad_vis)    ! (diffuse nir)
 
  ! adjust the air temperature to the domain mean elevation
- airtemp = airtemp - (DOMelev - elevation) * lapseRate
+ airtemp = airtemp - (DOMelev - elevation) * tempLapseRate
+ ! linear in elevation, so the area-weighted domains keep the HRU's precipitation
+ pptrate = pptrate * max(0._rkind, 1._rkind + precipElevGrad * (DOMelev - elevation))
+ ! the HRU's relative humidity and sky emissivity carried to the domain's temperature and pressure
+ if(DOMelev /= elevation)then
+  airtempDOM = airtempHRU - (DOMelev - elevation) * tempLapseRate
+  spechum  = RELHM2SPHM(min(1._rkind, SPHM2RELHM(spechum, airpresHRU, airtempHRU)), airpres, airtempDOM)
+  LWRadAtm = LWRadAtm * (airtempDOM/airtempHRU)**4
+ endif
 
  ! compute relative humidity (-)
  relhum   = SPHM2RELHM(spechum, airpres, airtemp)
@@ -315,8 +353,12 @@ contains
  ! compute vapor pressure of the air above the vegetation canopy (Pa)
  VPair = vapPress(spechum,airpres)
 
- ! compute wet bulb temperature (K)
- twetbulb = WETBULBTMP(airtemp, relhum, airpres)
+ ! compute wet bulb temperature (K), above the shallow glacier surface layer that sets the phase
+ if(katabaticCooling > 0._rkind)then
+  twetbulb = WETBULBTMP(airtemp + katabaticCooling, min(1._rkind, SPHM2RELHM(spechum, airpres, airtemp + katabaticCooling)), airpres)
+ else
+  twetbulb = WETBULBTMP(airtemp, relhum, airpres)
+ end if
 
  ! compute the maximum temperature of snow when the snow is predominantely frozen (K)
  maxFrozenSnowTemp = templiquid(unfrozenLiq,snowfrz_scale)
@@ -383,6 +425,33 @@ contains
  end associate
 
  end subroutine derivforce
+
+ ! ************************************************************************************************
+ ! public function calcPotentialEvap_Oudin2005: compute potential evaporation for HDS pond calculations
+ ! ************************************************************************************************
+ function calcPotentialEvap_Oudin2005(SWRadAtm, airtemp, K1, K2) result(potentialEvap)
+  ! calculate potential evaporation using the Oudin et al. (2005) formula for a specific HRU
+  USE multiconst,only:LH_vap,  & ! latent heat of vaporization   (J kg-1)
+                      iden_water ! intrinsic density of water    (kg m-3)
+  implicit none
+  ! function arguments
+  real(rkind),  intent(in)     :: SWRadAtm                ! downwelling shortwave radiation (W m-2)
+  real(rkind),  intent(in)     :: airtemp                 ! air temperature (K)
+  real(rkind),  intent(in)     :: K1                      ! scaling factor (deg C)
+  real(rkind),  intent(in)     :: K2                      ! minimum value of air temperature for which PE is not zero (deg C)
+  ! function result
+  real(rkind)                  :: potentialEvap           ! potential evaporation (mm s-1)
+
+  ! Oudin et al. (2005) formula
+  potentialEvap = 1000._rkind * &
+                  (SWRadAtm * 1.e-6_rkind / &                  ! W m-2 to MJ m-2 s-1
+                  (LH_vap * 1.e-6_rkind * iden_water)) * &     ! J kg-1 to MJ kg-1
+                  ((airtemp - 273.15_rkind + K2)/K1)            ! K to deg C
+
+  ! check for negative values
+  potentialEvap = max(potentialEvap, 0._rkind)
+
+ end function calcPotentialEvap_Oudin2005
 
 
 end module derivforce_module

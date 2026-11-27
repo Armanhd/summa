@@ -877,6 +877,10 @@ contains
  err = nf90_create(trim(filename),NF90_NETCDF4,ncid)
  message='iCreate[create]'; call netcdf_err(err,message); if(err/=0)return
 
+ ! mark the aquifer as started, so a later run with aquiferIni=emptyStart keeps the aquifer in this file
+ err = nf90_put_att(ncid,nf90_global,'aqEmptyStarted',1)
+ message='iCreate[aqEmptyStarted]'; call netcdf_err(err,message); if(err/=0)return
+
  ! define dimensions
                      err = nf90_def_dim(ncid,trim(gruDimName)    ,nGRU_local           ,    gruDimID); message='iCreate[gru]'     ; call netcdf_err(err,message); if(err/=0)return
                      err = nf90_def_dim(ncid,trim(hruDimName)    ,nHRU_local           ,    hruDimID); message='iCreate[hru]'     ; call netcdf_err(err,message); if(err/=0)return
@@ -1036,12 +1040,15 @@ contains
       end select
       if (err/=0) message=trim(message)//'writing variable:'//trim(bvar_meta(iVar)%varName); call netcdf_err(err,message); if (err/=0) return; err=0; message='writeRestart/'
     end do
-
-    ! include grids
-    call writeRestartGrid(ncid, nGRU_local, gruDimID, grid_meta, grid_data, err, cmessage); if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
   endif
   
  end do  ! iGRU loop
+
+ ! include grids: writeRestartGrid loops over every GRU itself, so it is called once, after the GRU loop,
+ ! rather than inside it, where the second GRU would find the grid dimension already defined
+ if (maxGlaciers > 0)then
+   call writeRestartGrid(ncid, nGRU_local, gruDimID, grid_meta, grid_data, err, cmessage); if(err/=0)then; message=trim(message)//trim(cmessage); return; endif
+ endif
 
  ! write dimensions and ID for file
  call write_id_info(ncid, gruDimID, hruDimID, domDimID, nglDimID, err, cmessage); if(err/=0) then; message=trim(message)//trim(cmessage); return; end if
@@ -1111,6 +1118,10 @@ contains
 
  ! grid variables
  ngdx = (/iLookGRID%surface_elev, iLookGRID%debris_thick/) ! array of desired variable indices
+
+ ! the prognostic, basin and index variables have already been written, so the file is in data mode
+ err = nf90_redef(ncid); message='iRedef[grid]'; call netcdf_err(err,message); if(err/=0)return
+ err=0; message='writeRestartGrid/'
 
  ! define dimensions
  err = nf90_def_dim(ncid,trim(gridDimName)   ,maxGrid     , gridDimID);message='iCreate[grid]'    ; call netcdf_err(err,message); if(err/=0)return

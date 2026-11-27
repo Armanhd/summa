@@ -217,13 +217,12 @@ contains
 
  end do  ! (looping thru layers)
 
- ! check that root density is within some reasonable version of machine tolerance
- ! This is the case when root density is greater than 1. Can only happen with powerLaw option.
+ ! trim any excess root density above one; a deficit is roots below the soil column
  error = sum(mLayerRootDensity) - 1._rkind
  if (error > 2._rkind*epsilon(rootingDepth_use)) then
   message=trim(message)//'problem with the root density calculation'
   err=20; return
- else
+ else if (error > 0._rkind) then
   mLayerRootDensity = mLayerRootDensity - error/real(nSoil,kind(rkind))
  end if
 
@@ -303,8 +302,6 @@ contains
 
  ! NOTE: could do constant profile with the power-law profile with exponent=1, but keep constant profile decision for clarity
  ix_hc_profile = model_decisions(iLookDECISIONS%hc_profile)%iDecision
- ! NOTE: the power-law profile drives conductivity to zero at the base of the soil, which would shut off the capillary flux
- !       from glacier ice melt in qDrainFlux; the exponential profile decays with depth but stays finite there
  if(nGlce>0) ix_hc_profile = expLaw_profile ! force exponential profile if glacier, loose bouldery debris at the surface grading to a silt-choked matrix at the ice interface
  select case(ix_hc_profile)
 

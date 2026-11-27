@@ -163,9 +163,7 @@ subroutine vegNrgFlux(&
   real(rkind)                        :: scalarAquiferStorage            ! aquifer storage (m)
   real(rkind)                        :: condToSoilLimiter              ! smooth limiter for condensation into pressurized top soil (-)
   real(rkind)                        :: posHeadTop                      ! smooth positive part of top-layer matric head (m)
-  real(rkind)                        :: condHeadArg                     ! nondimensional argument for condensation limiter (-)
-  real(rkind),parameter              :: condHeadCutoff=0._rkind         ! positive head where condensation-to-soil closure begins (m)
-  real(rkind),parameter              :: condHeadWidth=0.02_rkind        ! smoothing width for condensation-to-soil closure (m)
+  real(rkind),parameter              :: condHeadWidth=0.02_rkind        ! pressure-head scale of the Gaussian condensation-to-soil closure (m)
   real(rkind),parameter              :: condHeadSmooth=1.e-4_rkind      ! smoothing for max(psi,0) approximation (m)
   ! saturation vapor pressure of veg
   real(rkind)                        :: TV_celcius                      ! vegetaion temperature (C)
@@ -195,6 +193,7 @@ subroutine vegNrgFlux(&
   real(rkind)                        :: scalarGroundStabilityCorrection_old ! stability correction for the ground surface (-)
   ! turbulent heat transfer
   real(rkind)                        :: z0Ground                        ! roughness length of the ground (ground below the canopy or non-vegetated surface) (m)
+  logical(lgt)                       :: andreasScalar                   ! flag for a snow or ice surface whose heat and vapour roughness follows Andreas (1987)
   real(rkind)                        :: soilEvapFactor                  ! soil water control on evaporation from non-vegetated surfaces
   real(rkind)                        :: soilRelHumidity_noSnow          ! relative humidity in the soil pores [0-1]
   real(rkind)                        :: scalarLeafConductance           ! leaf conductance (m s-1)
@@ -243,6 +242,10 @@ subroutine vegNrgFlux(&
   real(rkind)                        :: dLatHeatCanopyTrans_dTCanair    ! derivative in the latent heat of canopy transpiration w.r.t. canopy air temperature
   real(rkind)                        :: dLatHeatCanopyTrans_dTCanopy    ! derivative in the latent heat of canopy transpiration w.r.t. canopy temperature
   real(rkind)                        :: dLatHeatCanopyTrans_dTGround    ! derivative in the latent heat of canopy transpiration w.r.t. ground temperature
+  ! heat advected with precipitation to the ground
+  real(rkind)                        :: rainRefTemp                     ! temperature the heat of the rain is relative to (K)
+  real(rkind)                        :: rainToGround,snowToGround       ! rain and snow whose heat enters through the ground surface (kg m-2 s-1)
+  real(rkind)                        :: dGroundAdvHeat_dTGround         ! derivative in the heat advected to the ground w.r.t. ground temperature (W m-2 K-1)
 
   ! ---------------------------------------------------------------------------------------
   ! point to variables in the data structure
@@ -581,6 +584,9 @@ subroutine vegNrgFlux(&
         else
           err=20; message=trim(message)//'unable to identify ground surface under potential snow'; return
         end if
+        ! glacier and lake snow and ice take Andreas (1987) for heat as their z0 is poorly known; upland snow and debris keep z0 for heat
+        andreasScalar = (nGlce>0 .or. nLake>0) .and. &
+                        (scalarGroundSnowFraction>0._rkind .or. (nLake>0 .and. groundTempTrial<=Tfreeze) .or. (nLake==0 .and. nSoil==0))
 
         ! compute the total vegetation area index (leaf plus stem)
         VAI        = scalarLAI + scalarSAI  ! vegetation area index
@@ -660,7 +666,7 @@ subroutine vegNrgFlux(&
                         computeVegFlux,                     & ! intent(in): logical flag to compute vegetation fluxes (.false. if veg buried by snow)
                         ix_veg_traits,                      & ! intent(in): choice of parameterization for vegetation roughness length and displacement height
                         ix_windPrfile,                      & ! intent(in): choice of canopy wind profile
-                        ix_astability,                      & ! intent(in): choice of stability function
+                        merge(mahrtExponential, ix_astability, nGlce>0 .and. andreasScalar), & ! intent(in): stability function, Mahrt (1987) over glacier snow and ice, where Louis (1979) suppresses turbulence in the katabatic layer
                         ! input: above-canopy forcing data
                         mHeight,                            & ! intent(in): measurement height (m)
                         airtemp,                            & ! intent(in): air temperature at measurement height (K)
@@ -673,6 +679,7 @@ subroutine vegNrgFlux(&
                         scalarSnowDepth,                    & ! intent(in): snow depth (m)
                         ! input: parameters
                         z0Ground,                           & ! intent(in): roughness length of the ground (below canopy or non-vegetated surface [snow]) (m)
+                        andreasScalar,                      & ! intent(in): flag for a heat and vapour roughness from Andreas (1987)
                         z0CanopyParam,                      & ! intent(in): roughness length of the canopy (m)
                         zpdFraction,                        & ! intent(in): zero plane displacement / canopy height (-)
                         critRichNumber,                     & ! intent(in): critical value for the bulk Richardson number where turbulence ceases (-)
@@ -956,10 +963,19 @@ subroutine vegNrgFlux(&
 
         ! compute the heat advected with precipitation (W m-2)
         ! NOTE: fluxes are in kg m-2 s-1, so no need to use density of water/ice here
-        scalarCanopyAdvectiveHeatFlux = -Cp_water*(scalarRainfall - scalarThroughfallRain)*(canopyTempTrial - scalarTwetbulb) + &
+        scalarCanopyAdvectiveHeatFlux = -Cp_water*(scalarRainfall - scalarThroughfallRain)*(max(canopyTempTrial,Tfreeze) - scalarTwetbulb) + & ! a cold canopy holds its cold content in its heat capacity
                                         (-Cp_ice)*(scalarSnowfall - scalarThroughfallSnow)*(canopyTempTrial - scalarTwetbulb)
-        scalarGroundAdvectiveHeatFlux = -Cp_water*scalarThroughfallRain*(groundTempTrial - scalarTwetbulb)         + &
-                                        (-Cp_ice)*scalarThroughfallSnow*(groundTempTrial - scalarTwetbulb)
+        ! rain on snow or ice brings its heat above freezing, the cold content is in the heat capacity of the layers
+        rainRefTemp = groundTempTrial
+        if (nSnow>0 .or. (nLake==0 .and. nSoil==0)) rainRefTemp = Tfreeze
+        rainToGround = scalarThroughfallRain
+        if (nSnow==0 .and. nLake==0 .and. nSoil>0) rainToGround = 0._rkind ! with the infiltration on bare soil
+        ! snow on a snow layer brings its heat as it is added to the layer
+        snowToGround = scalarThroughfallSnow
+        if (nSnow>0) snowToGround = 0._rkind
+        scalarGroundAdvectiveHeatFlux = -Cp_water*rainToGround*(rainRefTemp - scalarTwetbulb) - Cp_ice*snowToGround*(groundTempTrial - scalarTwetbulb)
+        dGroundAdvHeat_dTGround = -Cp_ice*snowToGround
+        if (.not.(nSnow>0 .or. (nLake==0 .and. nSoil==0))) dGroundAdvHeat_dTGround = dGroundAdvHeat_dTGround - Cp_water*rainToGround
 
         ! compute the mass flux associated with transpiration and evaporation/sublimation (J m-2 s-1 --> kg m-2 s-1)
         ! NOTE: remove water from the snow on the ground in preference to removing water from the water in soil pores
@@ -1000,8 +1016,7 @@ subroutine vegNrgFlux(&
         condToSoilLimiter = 1._rkind
         if (nSoil>0 .and. scalarGroundEvaporation > 0._rkind) then
           posHeadTop = 0.5_rkind*(mLayerMatricHead(1) + sqrt(mLayerMatricHead(1)**2_i4b + condHeadSmooth**2_i4b))
-          condHeadArg = (posHeadTop - condHeadCutoff)/condHeadWidth
-          condToSoilLimiter = 1._rkind/(1._rkind + exp(2._rkind*condHeadArg))
+          condToSoilLimiter = exp(-(posHeadTop/condHeadWidth)**2_i4b) ! one with zero slope at zero head, so unsaturated soil takes all condensation
           scalarGroundEvaporation = scalarGroundEvaporation*condToSoilLimiter
           scalarGroundSublimation = scalarGroundSublimation*condToSoilLimiter
         end if
@@ -1022,11 +1037,11 @@ subroutine vegNrgFlux(&
         dCanairNetFlux_dCanopyTemp = dTurbFluxCanair_dTCanopy
         dCanairNetFlux_dGroundTemp = dTurbFluxCanair_dTGround
         dCanopyNetFlux_dCanairTemp = dTurbFluxCanopy_dTCanair
-        dCanopyNetFlux_dCanopyTemp = dLWNetCanopy_dTCanopy + dTurbFluxCanopy_dTCanopy - Cp_water*(scalarRainfall - scalarThroughfallRain) - Cp_ice*(scalarSnowfall - scalarThroughfallSnow)
+        dCanopyNetFlux_dCanopyTemp = dLWNetCanopy_dTCanopy + dTurbFluxCanopy_dTCanopy - merge(Cp_water*(scalarRainfall - scalarThroughfallRain),0._rkind,canopyTempTrial>Tfreeze) - Cp_ice*(scalarSnowfall - scalarThroughfallSnow)
         dCanopyNetFlux_dGroundTemp = dLWNetCanopy_dTGround + dTurbFluxCanopy_dTGround
         dGroundNetFlux_dCanairTemp = dTurbFluxGround_dTCanair
         dGroundNetFlux_dCanopyTemp = dLWNetGround_dTCanopy + dTurbFluxGround_dTCanopy
-        dGroundNetFlux_dGroundTemp = dLWNetGround_dTGround + dTurbFluxGround_dTGround - Cp_water*scalarThroughfallRain - Cp_ice*scalarThroughfallSnow
+        dGroundNetFlux_dGroundTemp = dLWNetGround_dTGround + dTurbFluxGround_dTGround + dGroundAdvHeat_dTGround
 
         ! check if evaporation or sublimation
         if (scalarLatHeatSubVapCanopy < LH_vap+verySmall) then ! evaporation
@@ -1035,6 +1050,12 @@ subroutine vegNrgFlux(&
           dCanopyEvaporation_dTCanair = dLatHeatCanopyEvap_dTCanair/LH_vap   ! (kg m-2 s-1 K-1)
           dCanopyEvaporation_dTCanopy = dLatHeatCanopyEvap_dTCanopy/LH_vap   ! (kg m-2 s-1 K-1)
           dCanopyEvaporation_dTGround = dLatHeatCanopyEvap_dTGround/LH_vap   ! (kg m-2 s-1 K-1)
+          if (scalarLatHeatCanopyTrans > 0._rkind) then ! condensation on the transpiring leaves joins the canopy water
+            dCanopyEvaporation_dCanWat  = dCanopyEvaporation_dCanWat  + dLatHeatCanopyTrans_dCanWat/LH_vap
+            dCanopyEvaporation_dTCanair = dCanopyEvaporation_dTCanair + dLatHeatCanopyTrans_dTCanair/LH_vap
+            dCanopyEvaporation_dTCanopy = dCanopyEvaporation_dTCanopy + dLatHeatCanopyTrans_dTCanopy/LH_vap
+            dCanopyEvaporation_dTGround = dCanopyEvaporation_dTGround + dLatHeatCanopyTrans_dTGround/LH_vap
+          end if
         else ! sublimation
           dCanopyEvaporation_dCanWat  = 0._rkind  ! (s-1)
           dCanopyEvaporation_dTCanair = 0._rkind  ! (kg m-2 s-1 K-1)
@@ -1429,6 +1450,7 @@ subroutine aeroResist(&
                       snowDepth,                     & ! intent(in):  snow depth (m)
                       ! input: parameters
                       z0Ground,                      & ! intent(in):  roughness length of the ground (below canopy or non-vegetated surface [snow]) (m)
+                      andreasScalar,                 & ! intent(in):  flag for a heat and vapour roughness from Andreas (1987)
                       z0CanopyParam,                 & ! intent(in):  roughness length of the canopy (m)
                       zpdFraction,                   & ! intent(in):  zero plane displacement / canopy height (-)
                       critRichNumber,                & ! intent(in):  critical value for the bulk Richardson number where turbulence ceases (-)
@@ -1486,6 +1508,7 @@ subroutine aeroResist(&
   real(rkind),intent(in)           :: snowDepth                     ! snow depth (m)
   ! input: parameters
   real(rkind),intent(in)           :: z0Ground                      ! roughness length of the ground (below canopy or non-vegetated surface [snow]) (m)
+  logical(lgt),intent(in)          :: andreasScalar                 ! flag for a heat and vapour roughness from Andreas (1987)
   real(rkind),intent(in)           :: z0CanopyParam                 ! roughness length of the canopy (m)
   real(rkind),intent(in)           :: zpdFraction                   ! zero plane displacement / canopy height (-)
   real(rkind),intent(in)           :: critRichNumber                ! critical value for the bulk Richardson number where turbulence ceases (-)
@@ -1550,6 +1573,14 @@ subroutine aeroResist(&
   real(rkind)                      :: heightCanopyTopAboveSnow             ! height at the top of the vegetation canopy relative to snowpack (m)
   real(rkind)                      :: heightCanopyBottomAboveSnow          ! height at the bottom of the vegetation canopy relative to snowpack (m)
   real(rkind)                      :: minExpLogHgt                         ! minimum height above ground for logarithmic wind profile (m)
+  ! local variables: scalar roughness of snow and ice, Andreas (1987) Eq. 53 and Table I for temperature
+  real(rkind),parameter            :: viscAir = 1.3e-5_rkind               ! kinematic viscosity of air at -5 degC (m2 s-1)
+  real(rkind),parameter            :: RstarSmooth = 0.135_rkind            ! roughness Reynolds number below which the surface is smooth (-)
+  real(rkind),parameter            :: RstarRough = 2.5_rkind               ! roughness Reynolds number above which the surface is rough (-)
+  real(rkind),parameter            :: RstarMax = 1000._rkind               ! largest roughness Reynolds number of the fit (-)
+  real(rkind)                      :: Rstar                                ! roughness Reynolds number from the neutral friction velocity (-)
+  real(rkind)                      :: lnRstar                              ! log of the roughness Reynolds number (-)
+  real(rkind)                      :: z0hGround                            ! roughness length of the ground for heat and vapour (m)
   ! local variables: derivatives
   real(rkind)                      :: dFV_dT                               ! derivative in friction velocity w.r.t. canopy air temperature
   real(rkind)                      :: dED_dT                               ! derivative in eddy diffusivity at the top of the canopy w.r.t. canopy air temperature
@@ -1569,8 +1600,8 @@ subroutine aeroResist(&
   ! initialize error control
   err=0; message='aeroResist/'
 
-  ! check that measurement height is above the top of the canopy
-  if (mHeight < heightCanopyTop) then
+  ! check that measurement height is above the top of an exposed canopy
+  if (computeVegFlux .and. mHeight < heightCanopyTop) then
     err=20; message=trim(message)//'measurement height is below the top of the canopy'; return
   end if
 
@@ -1768,7 +1799,20 @@ subroutine aeroResist(&
     end if
 
     ! compute the resistance between the surface and canopy air UNDER NEUTRAL CONDITIONS (s m-1)
-    groundExNeut = (vkc**2_i4b) / ( log(heightAboveGround/z0Ground)**2_i4b) ! turbulent transfer coefficient under conditions of neutral stability (-)
+    ! heat and vapour roughness from the roughness Reynolds number of the neutral wind profile, held at the fit's limit above it
+    z0hGround = z0Ground
+    if (andreasScalar) then
+      Rstar = min(vkc*windspd/log(heightAboveGround/z0Ground)*z0Ground/viscAir, RstarMax)
+      if (Rstar <= RstarSmooth) then
+        z0hGround = z0Ground*exp(1.250_rkind)
+      else if (Rstar < RstarRough) then
+        z0hGround = z0Ground*exp(0.149_rkind - 0.550_rkind*log(Rstar))
+      else
+        lnRstar = log(Rstar)
+        z0hGround = z0Ground*exp(0.317_rkind - 0.565_rkind*lnRstar - 0.183_rkind*lnRstar**2_i4b)
+      end if
+    end if
+    groundExNeut = (vkc**2_i4b) / ( log(heightAboveGround/z0Ground)*log(heightAboveGround/z0hGround) ) ! turbulent transfer coefficient under conditions of neutral stability (-)
     groundResistanceNeutral = 1._rkind / (groundExNeut*windspd)
 
     ! compute ground stability correction

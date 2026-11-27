@@ -1,7 +1,7 @@
 # SUMMA-mizuRoute coupling tests
 
 Tests for the built-in SUMMA-mizuRoute coupling (`-DUSE_MIZUROUTE=ON`, see
-[docs/index.md](../../../docs/index.md)). There are three, unrelated except
+[docs/index.md](../../../docs/index.md)). There are four, unrelated except
 for all exercising the same coupling code -- pick the one that matches what
 you're checking:
 
@@ -10,6 +10,7 @@ you're checking:
 | **toy problem** | Bundled Provo domain + a made-up, single-chain river network. No real-world meaning; exists purely to exercise the coupling machinery. | `./test_mizuroute_bundled.sh` | `toy_prob/` (generated, gitignored) |
 | **Provo, real network** | Same bundled Provo domain, but routed through its *real* hydrofabric network, so it can be compared against the same domain routed with t-route/ngen. | `./test_mizuroute_provo_real_network.sh`, then `compare_to_troute.py` | `provo_real_network/` (generated, gitignored) |
 | **Bow real data** | A real, independent SUMMA-mizuRoute case study (Bow River at Banff): real forcing, real network + remapping, observed streamflow, KGE evaluation. Not a pass/fail check against anything above. | see [`bow_real_data/README.md`](bow_real_data/README.md), then `check_objective_func.R` | `bow_real_data/work/` (generated, gitignored) |
+| **lakes** | Bundled Provo domain with water-class HRUs and Doll and HYPE lakes, checked against independent values and against standalone mizuRoute. | `./test_mizuroute_lakes.sh` | `lake_test/` (generated, gitignored) |
 
 Only the toy problem is expected to run unmodified right after a fresh
 checkout -- it needs nothing beyond a mizuRoute-enabled build. `bow_real_data`
@@ -49,6 +50,34 @@ catchment areas agree with SUMMA's `attributes.nc` HRU areas (they're linked
 only through each `cat-*.input` file's `attrib_file_HRU_order`, so this is a
 real check, not a tautology).
 
+## `test_mizuroute_lakes.sh` -- lakes, coupled and standalone
+
+```
+./test_mizuroute_lakes.sh [work_dir]
+```
+
+`mizuroute_lake_test.py` changes a copy of the bundled domain so that two GRUs
+hold water-class HRUs, one of them two, draining to Doll and HYPE lakes. The
+test checks the lake precipitation and Oudin evaporation against values computed
+separately from the forcing file, and the water balance of each lake. It then
+routes what the coupled run sent through standalone mizuRoute, which must give
+the same streamflow and storage. That step needs `bin/route_runoff` from
+`make_mizuRoute.sh` and is reported as skipped without it.
+
+`make_mizuRoute.sh` assumes Homebrew and PnetCDF. With conda serial NetCDF and
+GCC 16 and no PnetCDF, build in a copy of `external/mizuRoute` with ParallelIO
+(`pio2_6_6`) at `libraries/parallelio`, leaving `PNETCDF_PATH` unset. Export
+`CC=mpicc`, `CFLAGS=-std=gnu17` and `CMAKE_POLICY_VERSION_MINIMUM=3.5`, add
+`-DCMAKE_RANLIB=/usr/bin/ranlib` to `CMAKE_OPTS` in `route/build/lib/Makefile`,
+and run `make` without `-j` from `route/build`:
+
+```
+make FC=gnu FC_EXE=mpif90 F_MASTER=<copy>/route/ NCDF_PATH=<conda env> MODE=fast EXE=route_runoff
+```
+
+The comparison tolerance is 1e-5 of each reach's largest value, as the standalone
+history file is single precision.
+
 ## Comparing against t-route: `compare_to_troute.py`
 
 `../test_ngen/provo_run.sh` runs the *same* Provo domain coupled inside ngen,
@@ -69,27 +98,26 @@ To compare them:
 should be a *reasonably* close one (median NSE ~0.98 on this domain), not
 wildly off. If you see something like a systematic ~3600x scale difference,
 or several reaches pinned at exactly zero t-route flow for the whole run,
-that's not this -- see the ngen-side history below.
+that's not this -- see the two coupling details below.
 
-Two ngen-side bugs used to make this comparison meaningless, both since
-fixed:
+- **Units.** ngen (`include/core/Layer.hpp`) and t-route both assume a
+  module's main output variable is a runoff rate in m/h, the convention
+  CFE, LSTM and dHBV2 follow. SUMMA's BMI therefore also exposes
+  `land_surface_water__runoff_volume_flux_mh` (the same runoff as
+  `land_surface_water__runoff_volume_flux`, in `m h-1` instead of `m s-1`),
+  and the realization configs use it as `main_output_variable`. Using the
+  m/s variable instead makes routed flow ~3600x too small.
+- **Confluences.** At a nexus fed by more than one catchment (any
+  tributary junction), ngen sums the contributing catchments' flows into
+  the single `nex-*_output.csv` value, so t-route can't tell which
+  flowpath each part belongs to, and several reaches get zero flow. The
+  provo routing config (`provo_routing.yaml`) therefore reads the
+  per-catchment `cat-*.csv` files instead
+  (`qlat_file_pattern_filter: "cat-*"`, `qlat_file_value_col:
+  land_surface_water__runoff_volume_flux_mh`). This needs a t-route that
+  supports `cat-*` input (CIROH-UA/t-route `ngiab`, PR #29).
 
-- Every catchment's flow into its nexus was silently divided by 3600 an
-  extra time in `Catchment_Formulation::update_models()`
-  (`include/core/Layer.hpp`) before ever reaching t-route.
-- At a confluence (a nexus fed by more than one catchment, i.e. any
-  tributary junction), ngen combines every contributing catchment's flow
-  into that nexus's single running total before it's ever written to disk
-  -- so t-route has no way to tell which flowpath a combined value's
-  components belong to. The provo realization configs in this domain
-  (`provo_realization_config_w_summa_bmi*.json`) opt in to
-  `"nexus_output_by_catchment": true`, which writes each catchment's own
-  flow, keyed by its own id, into `nex-*_output.csv` instead of the
-  nexus's combined total -- avoiding the combination rather than trying to
-  undo it. That flag defaults to off (existing behavior, existing
-  consumers, unchanged) everywhere else in ngen.
-
-With both fixed, what's left is genuine routing-scheme difference: mizuRoute
+With both handled, what's left is genuine routing-scheme difference: mizuRoute
 is run here with the kinematic wave method (`methods = "3"` in
 `test_mizuroute_provo_real_network.sh`), the same method the bundled test
 already validates. t-route defaults to a Muskingum-Cunge-like scheme
@@ -158,7 +186,8 @@ for other platforms) and copies it to `bin/route_runoff`.
   scripts, described above.
 - `make_mizuRoute.sh` -- builds the standalone `route_runoff` executable
   needed by `compare_mizuroute.R`, `compare_coupled_sequential_mizuroute.R`,
-  and `../test_regression/test_mizuroute_coupling.sh`.
+  `test_mizuroute_lakes.sh` and `../test_regression/test_mizuroute_coupling.sh`.
+- `test_mizuroute_lakes.sh`, `mizuroute_lake_test.py` -- the lake test.
 
 ## Requirements
 

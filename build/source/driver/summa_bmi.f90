@@ -56,8 +56,7 @@ module summabmi
   ! global data
   USE globalData, only: integerMissing                        ! missing integer
   USE globalData, only: print_step_freq                       ! frequency of printing model output
-  USE globalData, only: dJulianStart                          ! julian day of start time of simulation
-  USE globalData, only: dJulianFinsh                          ! julian day of end time of simulation
+  USE globalData, only: numtim                                ! number of native forcing intervals
   USE globalData, only: data_step                             ! length of time steps for the outermost timeloop
   USE globalData, only: startGRU                              ! index of the starting GRU for run
   USE globalData, only: ixRestart_iy,ixRestart_im,ixRestart_id,ixRestart_end,ixRestart_never ! restart file frequency options
@@ -91,7 +90,6 @@ module summabmi
   USE globalData, only: elapsedRead                           ! elapsed time for the forcing data read
   USE globalData, only: elapsedWrite                          ! elapsed time for the stats/write
   USE globalData, only: elapsedPhysics                        ! elapsed time for the physics
-  USE multiconst, only: secprday                              ! number of seconds in a day
   ! provide access to the named variables that describe elements of parent model structures
   USE var_lookup, only: iLookTIME                             ! named variables for time data structure
   USE var_lookup, only: iLookATTR                             ! named variables for real valued attribute data structure
@@ -212,6 +210,10 @@ module summabmi
   end type summa_bmi
   private
   public :: summa_bmi
+#ifdef NGEN_ACTIVE
+  ! Keep the C registration symbol visible to external interfaces.
+  public :: register_bmi
+#endif
 
   ! *****************************************************************************
   ! * variable definitions
@@ -226,7 +228,7 @@ module summabmi
 #else
   integer, parameter :: input_item_count = 7
 #endif
-  integer, parameter :: output_item_count = 16
+  integer, parameter :: output_item_count = 17
   character (len=BMI_MAX_VAR_NAME), target,dimension(input_item_count)  :: input_items
   character (len=BMI_MAX_VAR_NAME), target,dimension(output_item_count) :: output_items
   ! Buffers behind summa_get_ptr_int/float.  The BMI contract is that the returned pointer
@@ -313,7 +315,7 @@ module summabmi
      !       The arrays must still be allocated, as summa_paramSetup takes their size.
      allocate(param_name(0))
      allocate(param_value(0))
-     call summa_paramSetup(this%model%summa1_struc(n), param_name, param_value, err, message)
+     call summa_paramSetup(this%model%summa1_struc(n), param_name, param_value, err=err, message=message)
      call handle_err(err, message)
      deallocate(param_name)
      deallocate(param_value)
@@ -343,6 +345,7 @@ module summabmi
      this%model%newOutputFile = newOutputFile
 #ifndef NGEN_FORCING_ACTIVE
      this%model%forcFileInfo = forcFileInfo
+     this%model%nHRUfile = nHRUfile
      this%model%iFile = iFile
      this%model%forcingStep = forcingStep
      this%model%forcNcid = forcNcid
@@ -396,6 +399,7 @@ module summabmi
      ixRestart = this%model%ixRestart
 #ifndef NGEN_FORCING_ACTIVE
      forcFileInfo = this%model%forcFileInfo
+     nHRUfile = this%model%nHRUfile
      iFile = this%model%iFile
      forcingStep = this%model%forcingStep
      forcNcid = this%model%forcNcid
@@ -428,6 +432,13 @@ module summabmi
      if(.not.ngen_output_active)then
        call summa_writeOutputFiles(this%model%timeStep, this%model%summa1_struc(n), err, message)
        call handle_err(err, message)
+#ifndef NGEN_FORCING_ACTIVE
+     else
+       ! forcingStep is the time-record index in the native forcing file.
+       ! summa_writeOutputFiles normally advances it after each model step.
+       ! With framework-managed output, that call is skipped, so we advance here instead.
+       forcingStep = forcingStep + 1
+#endif
      endif
 
      ! update global variables that change during the model simulation
@@ -438,7 +449,7 @@ module summabmi
      this%model%nGRUrun = nGRUrun
      this%model%maxDOM = maxDOM
 #ifndef NGEN_FORCING_ACTIVE
-     this%model%nHRUrun = nHRUfile
+     this%model%nHRUfile = nHRUfile
      this%model%iFile = iFile
      this%model%forcingStep = forcingStep
      this%model%forcNcid = forcNcid
@@ -469,8 +480,7 @@ module summabmi
        bmi_status = BMI_FAILURE
        return
      end if
-     n_steps = nint( (time - current)/data_step ) + 1 ! model can only do a full data_step
-     ! SUMMA runs the ending step (so start=end would still run a step)
+     n_steps = nint( (time - current)/data_step ) ! model can only do a full data_step
      do i = 1, n_steps
        istat = this%update()
      end do
@@ -581,6 +591,7 @@ module summabmi
      output_items(14)= 'land_vegetation_energy~net~total__energy_flux'
      output_items(15)= 'land_surface_energy~net~total__energy_flux'
      output_items(16)= 'land_surface_water__baseflow_volume_flux'
+     output_items(17)= 'land_surface_water__runoff_volume_flux_mh'   !(runoff in m h-1, the main output ngen and t-route expect)
      names => output_items
      bmi_status = BMI_SUCCESS
    end function summa_output_var_names
@@ -601,7 +612,7 @@ module summabmi
      double precision, intent(out) :: time
      integer :: bmi_status
 
-     time = (dJulianFinsh - dJulianStart)*secprday ! unit seconds
+     time = real(numtim,dp)*data_step ! unit seconds
      bmi_status = BMI_SUCCESS
    end function summa_end_time
 
@@ -946,6 +957,7 @@ module summabmi
 
      ! output
      case('land_surface_water__runoff_volume_flux')        ; units = 'm s-1'     ; bmi_status = BMI_SUCCESS
+     case('land_surface_water__runoff_volume_flux_mh')     ; units = 'm h-1'     ; bmi_status = BMI_SUCCESS
      case('land_surface_water__evaporation_mass_flux')     ; units = 'mm s-1'    ; bmi_status = BMI_SUCCESS !equivalent kg m-2 s-1
      case('land_vegetation_water__evaporation_mass_flux')  ; units = 'mm s-1'    ; bmi_status = BMI_SUCCESS !equivalent kg m-2 s-1
      case('land_vegetation_water__transpiration_mass_flux'); units = 'mm s-1'    ; bmi_status = BMI_SUCCESS !equivalent kg m-2 s-1
@@ -1424,6 +1436,8 @@ module summabmi
               ! output is averaged over domains
               case('land_surface_water__runoff_volume_flux')
                 target_arr(i) = bvarStruct%gru(iGRU)%var(iLookBVAR%averageRoutedRunoff)%dat(1); exit
+              case('land_surface_water__runoff_volume_flux_mh')
+                target_arr(i) = bvarStruct%gru(iGRU)%var(iLookBVAR%averageRoutedRunoff)%dat(1) * 3600._rkind; exit
               case('land_surface_water__evaporation_mass_flux')
                 target_arr(i) = target_arr(i) + fluxStruct%gru(iGRU)%hru(jHRU)%dom(iDOM)%var(iLookFLUX%scalarGroundEvaporation)%dat(1) * fracDOM
               case('land_vegetation_water__evaporation_mass_flux')

@@ -71,38 +71,50 @@ USE globalData,only:maxGlceLayers          ! maximum number of glacier ice layer
 USE globalData,only:icefrz_mult            ! freezing curve scaling factor multipier of snow to ice, closer to a step function since ice does not hold water
 
 ! look-up values for the maximum interception capacity
-USE mDecisions_module,only:         &
-                      stickySnow,   &      ! maximum interception capacity an increasing function of temerature
-                      lightSnow            ! maximum interception capacity an inverse function of new snow density
+USE mDecisions_module,only:       &
+ stickySnow,                      & ! maximum interception capacity an increasing function of temerature
+ lightSnow                          ! maximum interception capacity an inverse function of new snow density
 
 ! look-up values for the groundwater parameterization
-USE mDecisions_module,only:         &
-                      qbaseTopmodel,&      ! TOPMODEL-ish baseflow parameterization
-                      bigBucket    ,&      ! a big bucket (lumped aquifer model)
-                      noExplicit           ! no explicit groundwater parameterization
+USE mDecisions_module,only:       &
+ qbaseTopmodel,                   & ! TOPMODEL-ish baseflow parameterization
+ bigBucket,                       & ! a big bucket (lumped aquifer model)
+ noExplicit                         ! no explicit groundwater parameterization
 
 ! look-up values for the spatial representation of groundwater
-USE mDecisions_module,only:         &
-                      localColumn  ,&      ! separate groundwater representation in each local soil column
-                      singleBasin          ! single groundwater store over the entire basin
+USE mDecisions_module,only:       &
+ localColumn                     ,& ! separate groundwater representation in each local soil column
+ singleBasin                        ! single groundwater store over the entire basin
 
 ! look-up values for the numerical method
-USE mDecisions_module,only:         &
-                      homegrown    ,&      ! homegrown backward Euler solution based on concepts from numerical recipes
-                      kinsol       ,&      ! SUNDIALS backward Euler solution using Kinsol
-                      ida                  ! SUNDIALS solution using IDA
+USE mDecisions_module,only:       &
+ homegrown                       ,& ! homegrown backward Euler solution based on concepts from numerical recipes
+ kinsol                          ,& ! SUNDIALS backward Euler solution using Kinsol
+ ida                                ! SUNDIALS solution using IDA
 
 ! look-up values for the choice of variable in energy equations (BE residual or IDA state variable)
-USE mDecisions_module,only:         &
-                      closedForm,   &      ! use temperature with closed form heat capacity
-                      enthalpyForm, &      ! use enthalpy with soil temperature-enthalpy lookup tables
-                      enthalpyFormAN       ! use enthalpy with soil temperature-enthalpy analytical solution
+USE mDecisions_module,only:       &
+ closedForm,                      & ! use temperature with closed form heat capacity
+ enthalpyForm,                    & ! use enthalpy with soil temperature-enthalpy lookup tables
+ enthalpyFormAN                     ! use enthalpy with soil temperature-enthalpy analytical solution
 
 
 ! privacy
 implicit none
 private
 public::coupled_em
+
+! temporary structures of coupled_em, kept per thread for reuse: one set per combination of snow, lake, soil and glacier ice layers at the start of the step
+integer(i4b),parameter  :: nWork=32                   ! number of sets kept per thread
+type :: coupled_em_work
+  integer(i4b)      :: nLayers(4)=-1                   ! snow, lake, soil and glacier ice layers the set was allocated for
+  integer(i8b)      :: lastUse=0                       ! call count at the last use of the set
+  type(var_ilength) :: indx_temp,indx_temp0
+  type(var_dlength) :: prog_temp,diag_temp,flux_mean,flux_inner
+end type coupled_em_work
+type(coupled_em_work),target :: work(nWork)           ! cached sets
+integer(i8b)                 :: nWorkCall=0           ! calls to coupled_em on this thread
+!$omp threadprivate(work, nWorkCall)
 contains
 
 
@@ -144,6 +156,7 @@ subroutine coupled_em(&
   USE canopySnow_module,only:canopySnow                         ! compute interception and unloading of snow from the vegetation canopy
   USE volicePack_module,only:newsnwfall                         ! compute change in the top snow layer due to throughfall and unloading
   USE volicePack_module,only:volicePack                         ! merge and sub-divide snow layers, if necessary
+  USE layerMerge_module,only:firnToIce                          ! turn firn at the bottom of the snow on glacier ice into glacier ice
   USE layerDivide_module,only:layerDivide                       ! sub-divide layers if they are too thick
   USE thermConductivity_module,only:init_thermConductivity      ! compute initialthermal conductivity of soil and snow layers  
   USE heat_Cp_Cm_module,only:init_heatCapacity                  ! compute initial heat capacity (Cp)
@@ -210,7 +223,8 @@ subroutine coupled_em(&
   logical(lgt)                         :: modifiedLayers           ! flag to denote that snow layers were modified
   logical(lgt)                         :: modifiedVegState         ! flag to denote that vegetation states were modified
   integer(i4b)                         :: maxSnowIceLayers         ! maximum number of snow/firn/ice layers
-  integer(i4b)                         :: nLayersRoots             ! number of soil layers that contain roots
+  integer(i4b)                         :: nRoots                   ! number of soil layers that contain roots
+  real(rkind),allocatable              :: rootDepthLayer(:)        ! root-zone thickness of each root layer (m)
   real(rkind)                          :: exposedVAI               ! exposed vegetation area index
   real(rkind)                          :: dCanopyWetFraction_dWat  ! derivative in wetted fraction w.r.t. canopy total water (kg-1 m2)
   real(rkind)                          :: dCanopyWetFraction_dT    ! derivative in wetted fraction w.r.t. canopy temperature (K-1)
@@ -227,10 +241,10 @@ subroutine coupled_em(&
   logical(lgt)                         :: doLayerMerge             ! flag to denote the need to merge snow layers
   logical(lgt),parameter               :: backwardsCompatibility=.false.  ! flag to denote a desire to ensure backwards compatibility with previous branches
   logical(lgt)                         :: checkMassBalance_ds      ! flag to check the mass balance over the data step
-  type(var_ilength)                    :: indx_temp                ! temporary model index variables saved only on outer loop
-  type(var_ilength)                    :: indx_temp0               ! temporary model index variables saved every time
-  type(var_dlength)                    :: prog_temp                ! temporary model prognostic variables
-  type(var_dlength)                    :: diag_temp                ! temporary model diagnostic variables
+  type(var_ilength),pointer            :: indx_temp                ! temporary model index variables saved only on outer loop
+  type(var_ilength),pointer            :: indx_temp0               ! temporary model index variables saved every time
+  type(var_dlength),pointer            :: prog_temp                ! temporary model prognostic variables
+  type(var_dlength),pointer            :: diag_temp                ! temporary model diagnostic variables
   real(rkind),allocatable              :: mLayerVolFracIceInit(:)  ! initial vector for volumetric fraction of ice (-)
   logical(lgt)                         :: noVeg                    ! flag to denote that there is no vegetation (lake or glacier)
   real(rkind)                          :: frz_scale_use            ! scaling parameter for the snow or glce freezing curve (K-1)
@@ -245,8 +259,9 @@ subroutine coupled_em(&
   real(rkind)                          :: massBalance              ! mass balance error (kg m-2)
   ! energy fluxes
   integer(i4b)                         :: iSoil                    ! index of soil layers
-  type(var_dlength)                    :: flux_mean                ! timestep-average model fluxes for a local HRU
-  type(var_dlength)                    :: flux_inner               ! inner step average model fluxes for a local HRU
+  type(var_dlength),pointer            :: flux_mean                ! timestep-average model fluxes for a local HRU
+  type(var_dlength),pointer            :: flux_inner               ! inner step average model fluxes for a local HRU
+  integer(i4b)                         :: iWork,jWork              ! index of the set of temporary structures
   real(rkind),allocatable              :: meanSoilCompress(:)      ! timestep-average soil compression by layer
   real(rkind),allocatable              :: innerSoilCompress(:)     ! inner step average soil compression by layer
   ! sublimation sums over substep and means over data_step
@@ -316,7 +331,7 @@ subroutine coupled_em(&
   logical(lgt)                         :: use_lookup               ! flag to use the lookup table for soil enthalpy, otherwise use analytical solution
   real(rkind), allocatable             :: depthGlceTopLayer(:)     ! depth of the top glacier ice layers at the start of the time step (m)
   integer(i4b)                         :: noThetaChange            ! number of layers with no change in total water content (bottom layers)
-  logical(lgt)                         :: divideLayer              ! flag to denote that a layer was divided
+  integer(i4b)                         :: nFirnToIce               ! number of firn layers turned into glacier ice
   ! ----------------------------------------------------------------------------------------------------------------------------------------------
   ! initialize error control
   err=0; message="coupled_em/"
@@ -337,6 +352,10 @@ subroutine coupled_em(&
   includeAquifer = (model_decisions(iLookDECISIONS%groundwatr)%iDecision==bigBucket)
   if (indx_data%var(iLookINDEX%nGlce)%dat(1) > 0) includeAquifer = .false. ! no aquifer in glacier domain
 
+  ! firn at pore close-off becomes glacier ice before the step's storage is counted, so no balance sees the move
+  call firnToIce(prog_data,diag_data,flux_data,indx_data,nFirnToIce,err,cmessage)
+  if(err/=0)then; err=20; message=trim(message)//trim(cmessage); return; end if
+
   ! initialize variables
   call initialize_coupled_em
 
@@ -353,6 +372,27 @@ subroutine coupled_em(&
     firstInnerStep = .true.
     lastInnerStep = .false.
 
+    ! use the set of temporary structures for these layer counts, else rebuild the least recently used set
+    nWorkCall = nWorkCall + 1
+    iWork = 0
+    do jWork=1,nWork
+      if(work(jWork)%nLayers(1)==nSnow .and. work(jWork)%nLayers(2)==nLake .and. work(jWork)%nLayers(3)==nSoil .and. work(jWork)%nLayers(4)==nGlce)then
+        iWork = jWork; exit
+      end if
+    end do
+    if(iWork==0)then
+      iWork = 1
+      do jWork=2,nWork
+        if(work(jWork)%lastUse < work(iWork)%lastUse) iWork = jWork
+      end do
+      if(allocated(work(iWork)%flux_mean%var))  deallocate(work(iWork)%flux_mean%var)
+      if(allocated(work(iWork)%flux_inner%var)) deallocate(work(iWork)%flux_inner%var)
+      work(iWork)%nLayers = -1
+    end if
+    work(iWork)%lastUse = nWorkCall
+    indx_temp => work(iWork)%indx_temp; indx_temp0 => work(iWork)%indx_temp0; prog_temp => work(iWork)%prog_temp
+    diag_temp => work(iWork)%diag_temp; flux_mean => work(iWork)%flux_mean; flux_inner => work(iWork)%flux_inner
+
     ! create temporary data structures for prognostic variables
     call resizeData(prog_meta(:),prog_data,prog_temp,err=err,message=cmessage)
     if(err/=0)then; err=20; message=trim(message)//trim(cmessage); return; endif
@@ -366,11 +406,14 @@ subroutine coupled_em(&
     call resizeData(indx_meta(:),indx_data,indx_temp0,err=err,message=cmessage)
     if(err/=0)then; err=20; message=trim(message)//trim(cmessage); return; endif
 
-    ! allocate space for the local fluxes
-    call allocLocal(averageFlux_meta(:)%var_info,flux_mean,nSnow,nLake,nSoil,nGlce,0_i4b,err,cmessage)
-    if(err/=0)then; err=20; message=trim(message)//trim(cmessage); return; end if
-    call allocLocal(averageFlux_meta(:)%var_info,flux_inner,nSnow,nLake,nSoil,nGlce,0_i4b,err,cmessage)
-    if(err/=0)then; err=20; message=trim(message)//trim(cmessage); return; end if
+    ! allocate space for the local fluxes unless the set already holds them
+    if(work(iWork)%nLayers(1)==-1)then
+      call allocLocal(averageFlux_meta(:)%var_info,flux_mean,nSnow,nLake,nSoil,nGlce,0_i4b,err,cmessage)
+      if(err/=0)then; err=20; message=trim(message)//trim(cmessage); return; end if
+      call allocLocal(averageFlux_meta(:)%var_info,flux_inner,nSnow,nLake,nSoil,nGlce,0_i4b,err,cmessage)
+      if(err/=0)then; err=20; message=trim(message)//trim(cmessage); return; end if
+      work(iWork)%nLayers = [nSnow,nLake,nSoil,nGlce]
+    end if
 
     ! initialize fluxes to average over data_step (averaged over substep in varSubstep)
     do iVar=1,size(averageFlux_meta)
@@ -474,9 +517,9 @@ subroutine coupled_em(&
 
     ! compute the number of layers with roots or layers that take infiltration
     if(nSoil>0)then
-      nLayersRoots = count(prog_data%var(iLookPROG%iLayerHeight)%dat(nSnow+nLake:(nSnow+nLake+nSoil-1)) < mpar_data%var(iLookPARAM%rootingDepth)%dat(1)-verySmall)
-      if(nGlce>0) nLayersRoots = nSoil ! if glacier ice exists, then all soil layers are considered to have roots
-      if(nLayersRoots==0)then
+      nRoots = count(prog_data%var(iLookPROG%iLayerHeight)%dat(nSnow+nLake:(nSnow+nLake+nSoil-1)) < mpar_data%var(iLookPARAM%rootingDepth)%dat(1)-verySmall)
+      if(nGlce>0) nRoots = nSoil ! if glacier ice exists, then all soil layers are considered to have roots
+      if(nRoots==0)then
         message=trim(message)//'no roots within the soil profile'
         err=20; return
       end if
@@ -491,10 +534,12 @@ subroutine coupled_em(&
     ! *** compute phenology...
     ! ------------------------
 
-    ! compute the temperature of the root zone: used in vegetation phenology
+    ! compute the temperature of the root zone, only used as a diagnostic variable, not used in the model calculations
     if(nSoil>0)then
-      diag_data%var(iLookDIAG%scalarRootZoneTemp)%dat(1) = sum(prog_data%var(iLookPROG%mLayerTemp)%dat(nSnow+nLake+1:nSnow+nLake+nLayersRoots)) &
-                                                                      / real(nLayersRoots, kind(rkind))
+      ! root-zone layer thickness, the deepest root layer truncated at the rooting depth
+      rootDepthLayer = prog_data%var(iLookPROG%mLayerDepth)%dat(nSnow+nLake+1:nSnow+nLake+nRoots)
+      rootDepthLayer(nRoots) = min(rootDepthLayer(nRoots), mpar_data%var(iLookPARAM%rootingDepth)%dat(1) - sum(rootDepthLayer(1:nRoots-1)))
+      diag_data%var(iLookDIAG%scalarRootZoneTemp)%dat(1) = sum(prog_data%var(iLookPROG%mLayerTemp)%dat(nSnow+nLake+1:nSnow+nLake+nRoots)*rootDepthLayer) / sum(rootDepthLayer)
     else
       diag_data%var(iLookDIAG%scalarRootZoneTemp)%dat(1) = realMissing
     endif
@@ -613,6 +658,7 @@ subroutine coupled_em(&
                     nLayers,                      & ! intent(in):    total number of layers
                     computeVegFlux,               & ! intent(in):    logical flag to compute vegetation fluxes (.false. if veg buried by snow)
                     type_data,                    & ! intent(in):    type of vegetation and soil
+                    mpar_data,                    & ! intent(in):    model parameters
                     prog_data,                    & ! intent(inout): model prognostic variables for a local HRU
                     diag_data,                    & ! intent(inout): model diagnostic variables for a local HRU
                     flux_data,                    & ! intent(inout): model flux variables
@@ -793,6 +839,7 @@ subroutine coupled_em(&
                         doLayerMerge,               & ! intent(in):    flag to force merge of snow layers
                         model_decisions,            & ! intent(in):    model decisions
                         mpar_data,                  & ! intent(in):    model parameters
+                        lookup_data,                & ! intent(in):    lookup tables
                         indx_data,                  & ! intent(inout): type of each layer
                         prog_data,                  & ! intent(inout): model prognostic variables for a local HRU
                         diag_data,                  & ! intent(inout): model diagnostic variables for a local HRU
@@ -1393,7 +1440,7 @@ subroutine coupled_em(&
 
         dt_wght = whole_step/data_step ! define weight applied to each sub-step
         do iVar=1,size(averageFlux_meta)
-          flux_mean%var(iVar)%dat(:)    = flux_mean%var(iVar)%dat(:) + flux_inner%var(iVar)%dat(:)*dt_wght
+          call add_weighted(flux_mean%var(iVar)%dat, flux_inner%var(iVar)%dat, dt_wght)
         end do
         meanCanopySublimation = meanCanopySublimation + sumCanopySublimation/data_step
         meanLatHeatCanopyEvap = meanLatHeatCanopyEvap + sumLatHeatCanopyEvap/data_step
@@ -1452,6 +1499,7 @@ subroutine coupled_em(&
                   data_step,                                                 & ! intent(in):    time step (seconds)
                   (nSnow>0),                                                 & ! intent(in):    logical flag if snow layers exist
                   snowfrz_scale,                                             & ! intent(in):    freeezing curve parameter for snow (K-1)
+                  lookup_data,                                               & ! intent(in):    lookup tables
                   ! input: diagnostic scalar variables
                   diag_data%var(iLookDIAG%scalarSnowfallTemp)%dat(1),        & ! intent(in):    computed temperature of fresh snow (K)
                   diag_data%var(iLookDIAG%scalarNewSnowDensity)%dat(1),      & ! intent(in):    computed density of new snow (kg m-3)
@@ -1766,7 +1814,10 @@ subroutine coupled_em(&
           write(*,'(a,1x,f20.10)') 'balanceSoilDrainage   = ', balanceSoilDrainage
           write(*,'(a,1x,f20.10)') 'balanceSoilET         = ', balanceSoilET
           write(*,'(a,1x,f20.10)') 'scalarSoilWatBalError = ', scalarSoilWatBalError
-          message=trim(message)//'soil hydrology does not balance'
+          write(cmessage,'(8(a,es10.3))') 'soil hydrology does not balance (kg m-2): error ', scalarSoilWatBalError, &
+                ', start ', balanceSoilWater0, ', end ', scalarTotalSoilWat, ', influx ', balanceSoilInflux, ', ET ', balanceSoilET, &
+                ', baseflow ', balanceSoilBaseflow, ', drainage ', balanceSoilDrainage, ', compress ', balanceSoilCompress
+          message=trim(message)//trim(cmessage)
           err=20; return
         end if
       else
@@ -1816,52 +1867,19 @@ subroutine coupled_em(&
         ! save the glacier ice water equivalent change
         scalarGlceWE = scalarGlceWE + balanceGlceWE - balanceGlceWE0
 
-        ! Reset the layers, ice content will have changed if layers merged
-        if (size(depthGlceTopLayer)<nGlce-noThetaChange)then
-          do iLayer = 1, nGlce-noThetaChange-size(depthGlceTopLayer)
-            call layerDivide(&
-                    ! input/output: model data structures
-                    .true.,                      & ! intent(in):    flag to denote that we are dividing glacier ice layers
-                    maxGlceLayers,               & ! intent(in):    maximum number of ice layers
-                    model_decisions,             & ! intent(in):    model decisions
-                    mpar_data,                   & ! intent(in):    model parameters
-                    indx_data,                   & ! intent(inout): type of each layer
-                    prog_data,                   & ! intent(inout): model prognostic variables for a local HRU
-                    diag_data,                   & ! intent(inout): model diagnostic variables for a local HRU
-                    flux_data,                   & ! intent(inout): model fluxes for a local HRU
-                    ! output
-                    divideLayer,                 & ! intent(out): flag to denote that layers were modified
-                    err,cmessage)                  ! intent(out): error control
-            if(err/=0)then; message=trim(message)//trim(cmessage); return; end if
+        ! the top glacier layers keep their prescribed depth, refilled from below at their own ice and liquid fractions
+        if(size(depthGlceTopLayer) == nGlce-noThetaChange)then
+          mLayerDepth(nSnow+nLake+nSoil+1:nLayers-noThetaChange) = depthGlceTopLayer
+          do jLayer=nSnow+nLake+nSoil+1,nLayers
+            iLayerHeight(jLayer) = iLayerHeight(jLayer-1) + mLayerDepth(jLayer)
+            mLayerHeight(jLayer) = (iLayerHeight(jLayer-1) + iLayerHeight(jLayer))/2._rkind
           end do
+        end if
 
-          ! save the number of layers
-          nGlce   = indx_data%var(iLookINDEX%nGlce)%dat(1)
-          ! compute the indices for the model state variables
-          call indexState(computeVegFlux,                    & ! intent(in):    flag to denote if computing the vegetation flux
-                          includeAquifer,                    & ! intent(in):    flag to denote if included the aquifer
-                          nSnow,nLake,nSoil,nGlce,nLayers,   & ! intent(in):    number of layers, and total number of layers
-                          indx_data,                         & ! intent(inout): indices defining model states and layers
-                          err,cmessage)                        ! intent(out):   error control
-          if(err/=0)then; message=trim(message)//trim(cmessage); return; end if
-
-        else if(size(depthGlceTopLayer)>nGlce-noThetaChange)then ! this should not happen
-          err=20; message=trim(message)//'glacier top ice layers divided, started too thick'; return
-        endif
-
-        ! reset the glacier depths
-        mLayerDepth(nSnow+nLake+nSoil+1:nLayers-noThetaChange) = depthGlceTopLayer
-        ! recalculate the layer heights
-        do jLayer=nSnow+nLake+nSoil+1,nLayers
-          iLayerHeight(jLayer) = iLayerHeight(jLayer-1) + mLayerDepth(jLayer)
-          mLayerHeight(jLayer) = (iLayerHeight(jLayer-1) + iLayerHeight(jLayer))/2._rkind
-        end do
-        
       else ! no glacier layers
         scalarGlceWE = 0._rkind
         balanceGlceWE = 0._rkind
       end if ! if glce layers exist
-      if(allocated(depthGlceTopLayer)) deallocate(depthGlceTopLayer)
       
       ! -----
       ! * balance checks for the aquifer...
@@ -1939,12 +1957,40 @@ subroutine coupled_em(&
       if(nGlce>0) scalarTotalGlceEnthalpy = sum(mLayerEnthalpy(nSnow+nLake+nSoil+1:nLayers) * mLayerDepth(nSnow+nLake+nSoil+1:nLayers))&
                                             /sum(mLayerDepth(nSnow+nLake+nSoil+1:nLayers))
       
+      ! -----
+      ! * frozen ground: the frost table and the active layer...
+      ! --------------------------------------------------------
+      ! the frost table is the top of the shallowest frozen layer, the active layer the ground above the frozen base
+      if(nSoil>0)then
+        associate(&
+          scalarFrostTableDepth  => diag_data%var(iLookDIAG%scalarFrostTableDepth)%dat(1) ,& ! depth to the top of the shallowest frozen soil layer (m)
+          scalarActiveLayerDepth => diag_data%var(iLookDIAG%scalarActiveLayerDepth)%dat(1) ) ! thickness of the soil above the perennially frozen ground (m)
+          scalarFrostTableDepth  = realMissing
+          scalarActiveLayerDepth = realMissing
+          do iLayer=nSnow+nLake+1,nSnow+nLake+nSoil ! down from the surface to the first frozen layer
+            if(mLayerVolFracIce(iLayer) > verySmall)then
+              scalarFrostTableDepth = iLayerHeight(iLayer-1)
+              exit
+            end if
+          end do
+          do iLayer=nSnow+nLake+nSoil,nSnow+nLake+1,-1 ! up from the base through the frozen run
+            if(mLayerVolFracIce(iLayer) <= verySmall) exit
+            scalarActiveLayerDepth = iLayerHeight(iLayer-1)
+          end do
+        end associate
+      end if
+
       ! save the surface temperature (just to make things easier to visualize)
       prog_data%var(iLookPROG%scalarSurfaceTemp)%dat(1) = prog_data%var(iLookPROG%mLayerTemp)%dat(1)
 
     end associate ! end association of local variables with information in the data structures
 
   end associate canopy  ! end association to canopy parameters
+
+  ! restore the number and the prescribed depths of the top glacier ice layers if any were merged within the step
+  call restoreGlceLayers(err,cmessage)
+  if(err/=0)then; message=trim(message)//trim(cmessage); return; end if
+  if(allocated(depthGlceTopLayer)) deallocate(depthGlceTopLayer)
 
   ! overwrite flux data with timestep-average value for all flux_mean vars, hard-coded to happen
   if(.not.backwardsCompatibility)then
@@ -1966,6 +2012,66 @@ subroutine coupled_em(&
   diag_data%var(iLookDIAG%wallClockTime)%dat(1) = elapsed_time
 
 contains
+
+ subroutine restoreGlceLayers(err,message)
+  ! *** Restore the top glacier ice layers to the depths they had at the start of the step ***
+  ! The top glacier layers keep a prescribed depth: the ice they lose to melt is replaced from the glacier beneath (the
+  ! mass change is in scalarGlceWE). A top layer thinned below zminLayer is merged into the one beneath by layerMerge
+  ! within the step; here the count is restored by dividing the top layer back (layerDivide duplicates its state and
+  ! every other vector of the layer, so the step's diagnostics stay defined), and the depths and heights are reset.
+  integer(i4b),intent(out)   :: err       ! error code
+  character(*),intent(out)   :: message   ! error message
+  integer(i4b)               :: iLayer    ! layer index
+  logical(lgt)               :: divideLayer ! flag to denote that a layer was divided
+  err=0; message='restoreGlceLayers/'
+  if(nGlce==0 .or. .not.allocated(depthGlceTopLayer)) return
+  if(size(depthGlceTopLayer) == nGlce-noThetaChange) return ! no layers merged: the depths were reset in place
+  if(size(depthGlceTopLayer) < nGlce-noThetaChange)then ! this should not happen
+    err=20; message=trim(message)//'more top glacier ice layers than at the start of the step'; return
+  end if
+
+  ! divide the top layer back until the count is restored
+  do iLayer = 1, size(depthGlceTopLayer)-(nGlce-noThetaChange)
+    call layerDivide(&
+                  ! input/output: model data structures
+                  .true.,                      & ! intent(in):    flag to denote that we are dividing glacier ice layers
+                  maxGlceLayers,               & ! intent(in):    maximum number of ice layers
+                  model_decisions,             & ! intent(in):    model decisions
+                  mpar_data,                   & ! intent(in):    model parameters
+                  indx_data,                   & ! intent(inout): type of each layer
+                  prog_data,                   & ! intent(inout): model prognostic variables for a local HRU
+                  diag_data,                   & ! intent(inout): model diagnostic variables for a local HRU
+                  flux_data,                   & ! intent(inout): model fluxes for a local HRU
+                  ! output
+                  divideLayer,                 & ! intent(out): flag to denote that layers were modified
+                  err,cmessage)                  ! intent(out): error control
+    if(err/=0)then; message=trim(message)//trim(cmessage); return; end if
+    if(.not.divideLayer)then; err=20; message=trim(message)//'expected to divide the top glacier ice layer'; return; end if
+  end do
+  ! save the number of layers, and recompute the indices for the model state variables
+  nGlce   = indx_data%var(iLookINDEX%nGlce)%dat(1)
+  nLayers = indx_data%var(iLookINDEX%nLayers)%dat(1)
+  call indexState(computeVegFlux,                    & ! intent(in):    flag to denote if computing the vegetation flux
+                  includeAquifer,                    & ! intent(in):    flag to denote if included the aquifer
+                  nSnow,nLake,nSoil,nGlce,nLayers,   & ! intent(in):    number of layers, and total number of layers
+                  indx_data,                         & ! intent(inout): indices defining model states and layers
+                  err,cmessage)                        ! intent(out):   error control
+  if(err/=0)then; message=trim(message)//trim(cmessage); return; end if
+
+  ! reset the glacier depths, and recalculate the layer heights
+  ! NOTE: through the data structure, since the vectors were just reallocated
+  associate(&
+   mLayerDepth  => prog_data%var(iLookPROG%mLayerDepth)%dat  ,& ! depth of each layer (m)
+   iLayerHeight => prog_data%var(iLookPROG%iLayerHeight)%dat ,& ! height of the layer interfaces (m)
+   mLayerHeight => prog_data%var(iLookPROG%mLayerHeight)%dat  & ! height of the layer mid-points (m)
+   )
+   mLayerDepth(nSnow+nLake+nSoil+1:nLayers-noThetaChange) = depthGlceTopLayer
+   do iLayer=nSnow+nLake+nSoil+1,nLayers
+     iLayerHeight(iLayer) = iLayerHeight(iLayer-1) + mLayerDepth(iLayer)
+     mLayerHeight(iLayer) = (iLayerHeight(iLayer-1) + iLayerHeight(iLayer))/2._rkind
+   end do
+  end associate
+ end subroutine restoreGlceLayers
 
  subroutine initialize_coupled_em
   ! *** Initialize steps for coupled_em subroutine ***
@@ -2043,6 +2149,16 @@ contains
  end subroutine initialize_coupled_em
 
 end subroutine coupled_em
+
+! **************************************************************************************************************
+! private subroutine add_weighted: dst = dst + src*wght, without the temporary added for possibly aliased pointers
+! **************************************************************************************************************
+subroutine add_weighted(dst,src,wght)
+  real(rkind),intent(inout) :: dst(:)  ! accumulated values
+  real(rkind),intent(in)    :: src(:)  ! values added
+  real(rkind),intent(in)    :: wght    ! weight applied to src
+  dst = dst + src*wght
+end subroutine add_weighted
 
 
 ! *********************************************************************************************************

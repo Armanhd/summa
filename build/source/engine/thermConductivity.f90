@@ -3,6 +3,7 @@ module thermConductivity_module
 
 ! data types
 USE nr_type
+USE scratch_module,only:sizeScratch  ! size the per-thread scratch arrays
 
 ! derived types to define the data structures
 USE data_types,only:&
@@ -286,7 +287,7 @@ subroutine thermConductivity(&
                     mLayerTemp,              & ! intent(in):    temperature at the current iteration (K)
                     mLayerMatricHead,        & ! intent(in):    matric head at the current iteration(m)                 
                     mLayerdTheta_dTk,        & ! intent(in):    derivative in volumetric liquid water content w.r.t. temperature (K-1)
-                    mLayerdTheta_dPsi,       & ! intent(in):    derivative in volumetric liquid water content w.r.t. liquid matric potential (m-1)
+                    mLayerdTheta_dPsi,       & ! intent(in):    derivative in water content w.r.t. the soil water state (m-1)
                     mLayerFracLiq,           & ! intent(in):    fraction of liquid water (-)
                     ! input/output: derivatives
                     dThermalC_dWatAbove,     & ! intent(inout): derivative in the thermal conductivity w.r.t. water state in the layer above
@@ -316,7 +317,7 @@ subroutine thermConductivity(&
   real(rkind),intent(in)               :: mLayerTemp(:)            ! temperature in each layer at the current iteration (m)
   real(rkind),intent(in)               :: mLayerMatricHead(:)      ! matric head in each layer at the current iteration (m)
   real(rkind),intent(in)               :: mLayerdTheta_dTk(:)      ! derivative in volumetric liquid water content w.r.t. temperature (K-1)
-  real(rkind),intent(in)               :: mLayerdTheta_dPsi(:)     ! derivative in volumetric liquid water content w.r.t. liquid matric potential (m-1)
+  real(rkind),intent(in)               :: mLayerdTheta_dPsi(:)     ! derivative in water content w.r.t. the soil water state (m-1)
   real(rkind),intent(in)               :: mLayerFracLiq(:)         ! fraction of liquid water (-)
   ! input/output: derivatives
   real(rkind),intent(inout)            :: dThermalC_dWatAbove(0:)  ! derivative in the thermal conductivity w.r.t. water state in the layer above
@@ -331,7 +332,6 @@ subroutine thermConductivity(&
   character(LEN=256)                   :: cmessage                 ! error message of downwind routine
   logical(lgt)                         :: doVegNrgFlux             ! flag to compute the energy flux over vegetation
   integer(i4b)                         :: iLayer                   ! index of model layers
-  integer(i4b)                         :: ixLayerDesired(1)        ! layer desired (scalar solution)
   integer(i4b)                         :: ixTop                    ! top layer in subroutine call
   integer(i4b)                         :: ixBot                    ! bottom layer in subroutine call
   integer(i4b)                         :: iSoil                    ! index of soil layer
@@ -347,8 +347,8 @@ subroutine thermConductivity(&
   real(rkind)                          :: kerstenNum               ! the Kersten number (-), defining weight applied to conductivity of the wet medium
   real(rkind)                          :: den                      ! denominator in the thermal conductivity calculations
   real(rkind)                          :: Tcrit                    ! temperature where all water is unfrozen (K)
-  real(rkind),dimension(nLayers)       :: dThermalC_dWat           ! derivative in thermal conductivity w.r.t. matric head or volumetric liquid water
-  real(rkind),dimension(nLayers)       :: dThermalC_dNrg           ! derivative in thermal conductivity w.r.t. temperature
+  real(rkind),allocatable,save         :: dThermalC_dWat(:)        ! derivative in thermal conductivity w.r.t. matric head or volumetric liquid water
+  real(rkind),allocatable,save         :: dThermalC_dNrg(:)        ! derivative in thermal conductivity w.r.t. temperature
   real(rkind)                          :: dlambda_wet_dWat         ! derivative in thermal conductivity of wet material w.r.t.soil water state variable
   real(rkind)                          :: dlambda_wet_dTk          ! derivative in thermal conductivity of wet material w.r.t. temperature
   real(rkind)                          :: dkerstenNum_dWat         ! derivative in Kersten number w.r.t. soil water state variable
@@ -366,6 +366,10 @@ subroutine thermConductivity(&
   real(rkind),parameter                :: f2=1.06_rkind            ! optimized parameter from Hansson et al. VZJ 2005 (-)
   real(rkind)                          :: fArg,xArg                ! temporary variables (see Hansson et al. VZJ 2005 for details)
   real(rkind)                          :: dxArg_dWat,dxArg_dTk     ! derivates of the temporary variables with respect to soil water state variable and temperature
+  ! one copy of the scratch arrays per thread
+  !$omp threadprivate(dThermalC_dWat, dThermalC_dNrg)
+
+  call sizeScratch(1,nLayers,dThermalC_dWat, dThermalC_dNrg)
 
   ! --------------------------------------------------------------------------------------------------------------------------------
   ! associate variables in data structure
@@ -411,9 +415,8 @@ subroutine thermConductivity(&
     doVegNrgFlux = (ixCasNrg/=integerMissing .or. ixVegNrg/=integerMissing .or. ixTopNrg/=integerMissing)
     if (nSnLaSoGlNrg>0) then
       if (scalarSolution) then
-        ixLayerDesired = pack(ixLayerState, ixSnLaSoGlNrg/=integerMissing)
-        ixTop = ixLayerDesired(1)
-        ixBot = ixLayerDesired(1)
+        ixTop = ixLayerState(findloc(ixSnLaSoGlNrg/=integerMissing, .true., 1)) ! first layer with an energy state in the subset
+        ixBot = ixTop
       else
         ixTop = 1
         ixBot = nLayers
@@ -564,7 +567,7 @@ subroutine thermConductivity(&
                                    lambda_air   * mLayerVolFracAir(iLayer)         ! air component
           ! compute derivatives
           dThermalC_dWat(iLayer) = lambda_ice*dVolFracIce_dWat + lambda_water*dVolFracLiq_dWat + lambda_air*(-dVolFracIce_dWat - dVolFracLiq_dWat)
-          dThermalC_dNrg(iLayer) = (lambda_ice - lambda_water) * dVolFracIce_dTk
+          dThermalC_dNrg(iLayer) = lambda_ice*dVolFracIce_dTk + lambda_water*dVolFracLiq_dTk + lambda_air*(-dVolFracIce_dTk - dVolFracLiq_dTk)
 
         ! * error check
         case default; err=20; message=trim(message)//'unable to identify type of layer to compute thermal conductivity'; return
@@ -580,10 +583,10 @@ subroutine thermConductivity(&
       ! ***** the lower boundary
       if (iLayer==nLayers) then ! assume the thermal conductivity at the domain boundaries is equal to the thermal conductivity of the layer
         iLayerThermalC(nLayers) = mLayerThermalC(nLayers)
-        dThermalC_dWatBelow(iLayer) = dThermalC_dWat(iLayer)
-        dThermalC_dTempBelow(iLayer) = dThermalC_dNrg(iLayer)
-        dThermalC_dWatAbove(iLayer) = realMissing
-        dThermalC_dTempAbove(iLayer) = realMissing
+        dThermalC_dWatAbove(iLayer) = dThermalC_dWat(iLayer)
+        dThermalC_dTempAbove(iLayer) = dThermalC_dNrg(iLayer)
+        dThermalC_dWatBelow(iLayer) = realMissing
+        dThermalC_dTempBelow(iLayer) = realMissing
       ! ***** internal layers
       else
         ! get temporary variables

@@ -39,6 +39,10 @@ covers the user-facing highlights.
   scaffolded but not yet active). Data structures gained a `dom` dimension throughout; the
   restart and attributes files gained `dom`, `glac` and glacier-grid variables. Runs without
   glaciers or wetlands are unchanged.
+- Glacier area evolves during a run: once a year a shallow-ice flow model with debris
+  transport is run on a per-glacier grid and the glacier domains are rebuilt from the result
+  (see [glacier geometry updates](configuration/SUMMA_configuration.md#glacier-geometry-updates)).
+  Four new GRU parameters control the debris model; all have defaults.
 - The number of soil layers no longer has to be the same in every HRU.
 
 ### Parallelization
@@ -67,13 +71,34 @@ covers the user-facing highlights.
   NetCDF output of every trial (PR #639).
 - Many basins can be calibrated in one job through a manifest file (`--manifest`) that lists
   cases and a configuration template (PR #639).
+- Calibration parameters are listed in `[calibration.parameters]`, one entry per parameter,
+  with optional `lower`, `upper` and `transformation`. Anything left out comes from the SUMMA
+  parameter files (or code defaults) and the transformation defaults to `none`, so
+  `theta_sat = {}` is enough. The older `param_list`, `parameter_transformations`,
+  `parameter_bounds` and ordered-chain `sample_gaps` keys are refused (PR #671).
+- `[calibration.spatial_multipliers]` and `[calibration.parameter_ratios]` search a factor on a
+  parameter's initialized field, or on another parameter, so spatial and layer patterns are kept
+  (PR #671).
+- A calibration target with `weight = 0.0` is scored and saved as a diagnostic without steering
+  DDS, and the Box-Cox exponent is set with `boxcox_lambda` (PR #671).
+- `[[parameter_dependencies.remainder]]` sets a parameter to a total minus other parameters,
+  e.g. `frac_silt = 1 - frac_sand - frac_clay`; a candidate leaving a negative remainder is
+  rejected.
+- Equal `lower` and `upper` bounds pin a calibration parameter. Layered parameters may be
+  empty in domains without those layers, so soil parameters calibrate on glacier-ice HRUs.
+- A failed trial's `rerun.sh` replays it with `--param` overrides when every calibrated
+  parameter is a physical value.
+- Calibration user guide under [calibration](calibration/index.md): parameters, constraints,
+  objectives, algorithms, parallel runs, outputs and example configurations (PR #675).
 
 ### Process options
 - New `infRateMax` decision for the maximum infiltration rate (`topmodel_GA`, `GreenAmpt`,
   `noInfExc`), and new `surfRun_SE` decision for saturation-excess surface runoff
   (`homegrown_SE`, `FUSEPRMS`, `FUSEAVIC`, `FUSETOPM`, `zero_SE`). Distinct
   `scalarSurfaceRunoff_IE` / `scalarSurfaceRunoff_SE` output fluxes were added.
-- New `aquiferIni` decision (`fullStart` / `emptyStart`).
+- New `aquiferIni` decision (`fullStart` / `emptyStart`). `emptyStart` empties the aquifer on a
+  cold start only: restart files carry an `aqEmptyStarted` attribute, and a run that reads one
+  keeps the aquifer storage the file holds.
 - Wind-profile / stability changes to fix over-estimated snow sublimation (affects
   `veg_traits = CM_QJRMS1988` most).
 - Soil and snow longwave emissivity updated (0.98/0.99 → 0.96/0.98).
@@ -102,6 +127,31 @@ covers the user-facing highlights.
   (`-DUSE_MIZUROUTE=ON`), adding `Q_reach`, `q_basin` and `upArea` output. Coupled mizuRoute
   needs the whole domain on one process, so it rejects `-g` and MPI domain parallelism
   (PR #632).
+- New `bcLowrTdyn` option `presFlux` prescribes an energy flux into the base of the soil column
+  (new parameter `lowerBoundNrgFlux`, W m-2, default 0.06, the continental geothermal heat
+  flux), so a deep column keeps a realistic temperature at depth instead of being insulated
+  (`zeroFlux`) or pinned to `lowerBoundTemp` (`presTemp`). This matters for permafrost and
+  cold-region runs, where the temperature at the base of the column sets the temperature of the
+  water draining from it. The flux is applied only where the bottom layer is soil; glacier
+  columns keep zero flux. Existing parameter files need no change (the parameter has a
+  default).
+- Fixed: writing a restart file failed with "String match to name in use" for any run with more
+  than one GRU and a glacier grid, because the grid write was called once per GRU when it
+  already loops over every GRU itself.
+- New frozen-ground diagnostics `scalarFrostTableDepth` (depth to the top of the shallowest
+  frozen soil layer, the freezing front working down from the surface) and
+  `scalarActiveLayerDepth` (the thickness of soil above the perennially frozen ground below it).
+  The two differ whenever a column freezes from both ends, which is the autumn state of a
+  permafrost column and the one a single thaw depth cannot describe. Both are missing when the
+  column has no such boundary.
+- Lateral flow out of a frozen soil layer is now impeded by its ice: the TOPMODEL transmissivity
+  of each layer is scaled by the same `10**(-f_impede * volFracIce)` factor `soilLiqFlux`
+  applies to the vertical conductivity, with the matching derivatives. Before this, a frozen
+  layer still drained laterally at its full rate, since the transmissivity profile is built from
+  the saturated conductivity alone. Affects `groundwatr = qTopmodl` runs with frozen soil.
+- New `groundwatr` option `bbLatflow`: as `bigBuckt`, but the upland soil also drains laterally
+  to the channel, at each layer's own temperature, as `qTopmodl` does, while its
+  base still recharges the bucket. `bigBuckt` is unchanged, bit for bit.
 - Optional coupling to the OpenWQ water-quality framework (`build/source/openwq/`).
 - Runs as a NextGen submodule; NextGen test cases are in `utils/test/test_ngen/`.
 - Large refactor: object-oriented flux routines, much shorter `computFlux.f90` and the
@@ -109,6 +159,14 @@ covers the user-facing highlights.
 
 ## Pre-release
 ### Major changes
+- Fixed: writing a restart file failed for any run with more than one GRU and a glacier grid.
+- A soil layer's lateral outflow is capped at the drainable water it holds over the data step.
+- The infiltration closure under saturation scales to the depth of the zone it averages over, so
+  a thin glacier debris column closes off as a soil column does.
+- Exfiltration returns the surplus a nearly full column cannot store whatever face it arrived
+  through, not only the lateral inflow. This closes the water balance of a glacier debris column
+  fed by melt from below; a free-draining soil column is unchanged, since the relief only opens
+  once available storage falls below 2 mm.
 - General cleanup and shortening of computFlux.f90, vegNrgFlux.f90, snowSoilNrgFlux.f90, vegLiqFlux.f90, snowLiqFlux.f90, soilLiqFlux.f90, groundwatr.f90, and bigAquifer.f90 
 - Added object-oriented methods to simplify flux routine calls in computFlux and improve modularity
     - classes for each flux routine were added to data_types.f90

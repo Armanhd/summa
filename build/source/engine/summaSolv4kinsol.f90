@@ -27,6 +27,7 @@ USE type4kinsol
 
 ! access missing values
 USE globalData,only:integerMissing  ! missing integer
+USE globalData,only:soilLateralFlow ! flag: soil layers drain laterally
 USE globalData,only:realMissing     ! missing real number
 
 ! access matrix information
@@ -70,12 +71,22 @@ USE mDecisions_module,only:       &
   numerical,                      & ! numerical solution
   analytical                        ! analytical solution
 
+USE fsundials_core_mod,only:N_Vector  ! SUNDIALS vector type for the saved vectors
+
 ! privacy
  implicit none
  private::setInitialCondition
  private::setSolverParams
  private::getErrMessage
  public::summaSolv4kinsol
+
+! SUNDIALS context and serial vectors kept per thread; the vectors are re-pointed at each call's arrays
+type(c_ptr),save                  :: sunctxSave = c_null_ptr  ! SUNDIALS simulation context
+type(N_Vector),pointer,save       :: sunvecSave_y => null()   ! solution vector
+type(N_Vector),pointer,save       :: sunvecSave_fscale => null() ! function scaling vector
+type(N_Vector),pointer,save       :: sunvecSave_xscale => null() ! state scaling vector
+integer(c_long),save              :: nStateSave = 0           ! length of the saved vectors
+!$omp threadprivate(sunctxSave, sunvecSave_y, sunvecSave_fscale, sunvecSave_xscale, nStateSave)
 
 contains
 
@@ -197,6 +208,7 @@ subroutine summaSolv4kinsol(&
   type(N_Vector),           pointer :: sunvec_xscale        ! vector containing diagonal elements of state scaling matrix
   type(SUNLinearSolver),    pointer :: sunlinsol_LS         ! sundials linear solver
   type(c_ptr)                       :: kinsol_mem           ! KINSOL memory
+  type(c_ptr),              target  :: sunlogger            ! SUNDIALS logger
   type(c_ptr)                       :: sunctx               ! SUNDIALS simulation context
   type(data4kinsol),        target  :: eqns_data            ! KINSOL type
   integer(i4b)                      :: retval, retvalr      ! return value
@@ -222,6 +234,8 @@ subroutine summaSolv4kinsol(&
   kinsolSucceeds = .true.
 
   ! fill eqns_data which will be required later to call eval8summa
+  eqns_data%err                 = 0
+  eqns_data%message             = ''
   eqns_data%dt_cur              = dt_cur
   eqns_data%dt                  = dt
   eqns_data%nSnow               = nSnow
@@ -258,7 +272,7 @@ subroutine summaSolv4kinsol(&
   allocate( eqns_data%stateVecPrev(int(nState,i4b)) ); eqns_data%stateVecPrev = stateVecInit  
 
   ! allocate space for other variables
-  if(model_decisions(iLookDECISIONS%groundwatr)%iDecision==qbaseTopmodel .or. (nGlce>0 .and. nSoil>0))then ! need the baseflow derivatives if have TOPMODEL groundwater or glacier debris (since debris has lateral flow)
+  if(soilLateralFlow .or. (nGlce>0 .and. nSoil>0))then ! need the baseflow derivatives if have TOPMODEL groundwater or glacier debris (since debris has lateral flow)
     allocate(eqns_data%dBaseflow_dWat(nSoil,nSoil),eqns_data%dBaseflow_dTk(nSoil,nSoil),stat=err)
   else
     allocate(eqns_data%dBaseflow_dWat(0,0),eqns_data%dBaseflow_dTk(0,0),stat=err)
@@ -268,17 +282,36 @@ subroutine summaSolv4kinsol(&
   allocate( eqns_data%resVec(int(nState,i4b)) )
   allocate( eqns_data%resSink(int(nState,i4b)) )
   
-  retval = FSUNContext_Create(SUN_COMM_NULL, sunctx)
+  ! create the SUNDIALS context once per thread
+  if (.not. c_associated(sunctxSave)) then
+    retval = FSUNContext_Create(SUN_COMM_NULL, sunctxSave)
+    if (retval /= 0) then; err = 20; message = trim(message)//'error in FSUNContext_Create'; return; endif
+  endif
+  sunctx = sunctxSave
+  sunlogger = c_null_ptr
+  retval = FSUNContext_GetLogger(sunctx, sunlogger)
+  if (retval /= 0) then; err = 20; message = trim(message)//'error in FSUNContext_GetLogger'; return; endif
 
-  ! create serial vectors
-  sunvec_y => FN_VMake_Serial(nState, stateVec, sunctx)
-  if (.not. associated(sunvec_y)) then; err=20; message=trim(message)//'sunvec = NULL'; return; endif
-
-  ! create the scaling vectors
-  sunvec_fscale => FN_VMake_Serial(nState, fscale, sunctx)
-  if (.not. associated(sunvec_fscale)) then; err=20; message=trim(message)//'sunvec = NULL'; return; endif
-  sunvec_xscale => FN_VMake_Serial(nState, xscale, sunctx)
-  if (.not. associated(sunvec_xscale)) then; err=20; message=trim(message)//'sunvec = NULL'; return; endif
+  ! make the serial vectors only when the number of states changes, then point them at this call's arrays
+  if (nState /= nStateSave) then
+    if (associated(sunvecSave_y)) then
+      call FN_VDestroy(sunvecSave_y); call FN_VDestroy(sunvecSave_fscale); call FN_VDestroy(sunvecSave_xscale)
+      sunvecSave_y => null(); sunvecSave_fscale => null(); sunvecSave_xscale => null(); nStateSave = 0
+    endif
+    sunvecSave_y => FN_VMake_Serial(nState, stateVec, sunctx)
+    if (.not. associated(sunvecSave_y)) then; err=20; message=trim(message)//'sunvec = NULL'; return; endif
+    sunvecSave_fscale => FN_VMake_Serial(nState, fscale, sunctx)
+    if (.not. associated(sunvecSave_fscale)) then; err=20; message=trim(message)//'sunvec = NULL'; return; endif
+    sunvecSave_xscale => FN_VMake_Serial(nState, xscale, sunctx)
+    if (.not. associated(sunvecSave_xscale)) then; err=20; message=trim(message)//'sunvec = NULL'; return; endif
+    nStateSave = nState
+  endif
+  call FN_VSetArrayPointer(stateVec, sunvecSave_y)
+  call FN_VSetArrayPointer(fscale, sunvecSave_fscale)
+  call FN_VSetArrayPointer(xscale, sunvecSave_xscale)
+  sunvec_y => sunvecSave_y
+  sunvec_fscale => sunvecSave_fscale
+  sunvec_xscale => sunvecSave_xscale
 
   ! initialize solution vectors
   call setInitialCondition(nState, stateVecInit, sunvec_y)
@@ -337,8 +370,8 @@ subroutine summaSolv4kinsol(&
 
   ! Disable error messages and warnings
   if(offErrWarnMessage) then
-    retval = FSUNLogger_SetErrorFilename(kinsol_mem, c_null_char)
-    retval = FSUNLogger_SetWarningFilename(kinsol_mem, c_null_char)
+    retval = FSUNLogger_SetErrorFilename(sunlogger, c_null_char)
+    retval = FSUNLogger_SetWarningFilename(sunlogger, c_null_char)
   endif
 
   !****************************** Main Solver **********************************************
@@ -409,11 +442,6 @@ subroutine summaSolv4kinsol(&
   retval = FSUNLinSolFree(sunlinsol_LS)
   if(retval /= 0)then; err=20; message=trim(message)//'unable to free the linear solver'; return; endif
   call FSUNMatDestroy(sunmat_A)
-  call FN_VDestroy(sunvec_y)
-  call FN_VDestroy(sunvec_xscale)
-  call FN_VDestroy(sunvec_fscale)
-  retval = FSUNContext_Free(sunctx)
-  if(retval /= 0)then; err=20; message=trim(message)//'unable to free the SUNDIALS context'; return; endif
 
 end subroutine summaSolv4kinsol
 

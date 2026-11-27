@@ -249,6 +249,7 @@ contains
   case('tempCritRain'             ); get_ixParam = iLookPARAM%tempCritRain           ! critical temperature where precipitation is rain (K)
   case('tempRangeTimestep'        ); get_ixParam = iLookPARAM%tempRangeTimestep      ! temperature range over the time step (K)
   case('frozenPrecipMultip'       ); get_ixParam = iLookPARAM%frozenPrecipMultip     ! frozen precipitation multiplier (-)
+  case('precipElevGrad'           ); get_ixParam = iLookPARAM%precipElevGrad         ! fractional change in precipitation per metre above the HRU elevation (m-1)
   ! freezing curve for snow
   case('snowfrz_scale'            ); get_ixParam = iLookPARAM%snowfrz_scale          ! scaling parameter for the freezing curve for snow (K-1)
   case('fixedThermalCond_snow'    ); get_ixParam = iLookPARAM%fixedThermalCond_snow  ! temporally constant thermal conductivity for snow (W m-1 K-1)
@@ -292,7 +293,7 @@ contains
   ! water flow through snow
   case('Fcapil'                   ); get_ixParam = iLookPARAM%Fcapil                 ! capillary retention as a fraction of the total pore volume (-)
   case('k_snow'                   ); get_ixParam = iLookPARAM%k_snow                 ! hydraulic conductivity of snow (m s-1), 0.0055 = approx. 20 m/hr, from UEB
-  case('mw_exp'                   ); get_ixParam = iLookPARAM%mw_exp                 ! exponent for meltwater flow (-)
+  case('mw_exp'                   ); get_ixParam = iLookPARAM%mw_exp                 ! exponent on relative saturation in meltwater drainage (-)
   ! turbulent heat fluxes
   case('z0Water'                  ); get_ixParam = iLookPARAM%z0Water                ! roughness length of open water (m)
   case('z0Ice'                    ); get_ixParam = iLookPARAM%z0Ice                  ! roughness length of ice (m) 
@@ -306,8 +307,8 @@ contains
   case('Mahrt87_eScale'           ); get_ixParam = iLookPARAM%Mahrt87_eScale         ! exponential scaling factor in the Mahrt (1987) stability function (-)
   case('leafExchangeCoeff'        ); get_ixParam = iLookPARAM%leafExchangeCoeff      ! turbulent exchange coeff between canopy surface and canopy air ( m s-(1/2) )
   case('windReductionParam'       ); get_ixParam = iLookPARAM%windReductionParam     ! canopy wind reduction parameter (-)
-  case('glacierWindFactor'        ); get_ixParam = iLookPARAM%glacierWindFactor      ! wind speed increase to account for glacier katabatic wind profile (-)
-  case('glacierTempReduction'     ); get_ixParam = iLookPARAM%glacierTempReduction   ! air temperature decrease to account for down-glacier katabatic wind (-)
+  case('glacierWindFactor'        ); get_ixParam = iLookPARAM%glacierWindFactor      ! wind speed factor to account for glacier sheltering and katabatic wind profile (-)
+  case('glacierTempReduction'     ); get_ixParam = iLookPARAM%glacierTempReduction   ! air temperature factor decrease to account for down-glacier katabatic wind (-)
   ! stomatal conductance
   case('Kc25'                     ); get_ixParam = iLookPARAM%Kc25                   ! Michaelis-Menten constant for CO2 at 25 degrees C (umol mol-1)
   case('Ko25'                     ); get_ixParam = iLookPARAM%Ko25                   ! Michaelis-Menten constant for O2 at 25 degrees C (mol mol-1)
@@ -384,7 +385,7 @@ contains
   case('aquiferBaseflowRate'      ); get_ixParam = iLookPARAM%aquiferBaseflowRate    ! baseflow rate when aquifer storage = aquiferScaleFactor (m s-1)
   case('aquiferScaleFactor'       ); get_ixParam = iLookPARAM%aquiferScaleFactor     ! scaling factor for aquifer storage in the big bucket (m)
   case('aquiferBaseflowExp'       ); get_ixParam = iLookPARAM%aquiferBaseflowExp     ! baseflow exponent (-)
-  case('qSurfScale'               ); get_ixParam = iLookPARAM%qSurfScale             ! scaling factor in the surface runoff parameterization (-)
+  case('qSurfScale'               ); get_ixParam = iLookPARAM%qSurfScale             ! shape of the infiltration area (-)
   case('specificYield'            ); get_ixParam = iLookPARAM%specificYield          ! specific yield (-)
   case('specificStorage'          ); get_ixParam = iLookPARAM%specificStorage        ! specific storage coefficient (m-1)
   case('f_impede'                 ); get_ixParam = iLookPARAM%f_impede               ! ice impedence factor (-)
@@ -450,6 +451,13 @@ contains
   case('zmaxLayer2_upper'         ); get_ixParam = iLookPARAM%zmaxLayer2_upper       ! maximum layer depth for the 2nd layer when > 2 layers (m)
   case('zmaxLayer3_upper'         ); get_ixParam = iLookPARAM%zmaxLayer3_upper       ! maximum layer depth for the 3rd layer when > 3 layers (m)
   case('zmaxLayer4_upper'         ); get_ixParam = iLookPARAM%zmaxLayer4_upper       ! maximum layer depth for the 4th layer when > 4 layers (m)                              
+  ! lower boundary condition for thermodynamics
+  case('lowerBoundNrgFlux'        ); get_ixParam = iLookPARAM%lowerBoundNrgFlux      ! energy flux at the lower boundary, the geothermal heat flux (W m-2)
+  ! Oudin et al. (2005) potential evaporation parameters
+  case('oudinPETScaleK1'          ); get_ixParam = iLookPARAM%oudinPETScaleK1        ! Oudin PET formula scaling factor (deg C)
+  case('oudinPETTempThrK2'        ); get_ixParam = iLookPARAM%oudinPETTempThrK2      ! Oudin PET formula temperature threshold (deg C)
+  case('tempLapseRate'            ); get_ixParam = iLookPARAM%tempLapseRate          ! air temperature decrease per metre above the HRU elevation (K m-1)
+  case('firnViscosity'            ); get_ixParam = iLookPARAM%firnViscosity          ! viscosity of glacier firn under its overburden, scaled by the remaining pore space (Pa s)
   ! get to here if cannot find the variable
   case default
    get_ixParam = integerMissing
@@ -655,6 +663,9 @@ contains
   case('hLast'                          ); get_ixDiag = iLookDIAG%hLast                            ! step size used on the last internal step
   case('hCur'                           ); get_ixDiag = iLookDIAG%hCur                             ! step size to be used on the next internal step
   case('tCur'                           ); get_ixDiag = iLookDIAG%tCur                             ! current time reached by the integrator
+  ! frozen ground
+  case('scalarFrostTableDepth'          ); get_ixDiag = iLookDIAG%scalarFrostTableDepth            ! depth to the top of the shallowest frozen soil layer (m)
+  case('scalarActiveLayerDepth'         ); get_ixDiag = iLookDIAG%scalarActiveLayerDepth           ! thickness of the soil above the perennially frozen ground below it (m)
   ! get to here if cannot find the variable
   case default
    get_ixDiag = integerMissing
@@ -759,6 +770,7 @@ contains
   case('scalarSurfaceRunoff'            ); get_ixFlux = iLookFLUX%scalarSurfaceRunoff              ! surface runoff (m s-1)
   case('scalarSurfaceRunoff_IE'         ); get_ixFlux = iLookFLUX%scalarSurfaceRunoff_IE           ! infiltration excess surface runoff (m s-1)
   case('scalarSurfaceRunoff_SE'         ); get_ixFlux = iLookFLUX%scalarSurfaceRunoff_SE           ! saturation excess surface runoff (m s-1)
+  case('scalarLowerBoundNrgFlux'        ); get_ixFlux = iLookFLUX%scalarLowerBoundNrgFlux          ! conductive energy flux across the lower boundary, positive down (W m-2)
   case('mLayerSatHydCondMP'             ); get_ixFlux = iLookFLUX%mLayerSatHydCondMP               ! saturated hydraulic conductivity of macropores in each layer (m s-1)
   case('mLayerSatHydCond'               ); get_ixFlux = iLookFLUX%mLayerSatHydCond                 ! saturated hydraulic conductivity in each layer (m s-1)
   case('iLayerSatHydCond'               ); get_ixFlux = iLookFLUX%iLayerSatHydCond                 ! saturated hydraulic conductivity in each layer interface (m s-1)
@@ -778,6 +790,9 @@ contains
   case('scalarTotalRunoff'              ); get_ixFlux = iLookFLUX%scalarTotalRunoff                ! total runoff (m s-1)
   case('scalarGlacierMelt'              ); get_ixFlux = iLookFLUX%scalarGlacierMelt                ! glacier melt (goes into glacier internal reservoir) (m s-1)
   case('scalarNetRadiation'             ); get_ixFlux = iLookFLUX%scalarNetRadiation               ! net radiation (W m-2)
+  case('mLayerColumnInflowNrg'          ); get_ixFlux = iLookFLUX%mLayerColumnInflowNrg            ! heat the lateral inflow carries into each soil layer, above freezing (W)
+  case('mLayerLatInflowNrgFlux'         ); get_ixFlux = iLookFLUX%mLayerLatInflowNrgFlux           ! energy source in each soil layer from the lateral inflow (J m-3 s-1)
+  case('mLayerSoilAdvNrgFlux'           ); get_ixFlux = iLookFLUX%mLayerSoilAdvNrgFlux             ! energy source in each soil layer from water entering from above and below (J m-3 s-1)
   ! return missing if variable not found
   case default
    get_ixFlux = integerMissing
@@ -895,6 +910,16 @@ contains
   case('dCanopyTemp_dCanWat'            ); get_ixDeriv = iLookDERIV%dCanopyTemp_dCanWat            ! derivative of canopy temperature w.r.t. volumetric water content  
   case('dTemp_dTheta'                   ); get_ixDeriv = iLookDERIV%dTemp_dTheta                   ! derivative of temperature w.r.t. volumetric water content         
   case('dTemp_dPsi0'                    ); get_ixDeriv = iLookDERIV%dTemp_dPsi0                    ! derivative of temperature w.r.t. total water matric potential         
+  case('dExfil_dDrive'                  ); get_ixDeriv = iLookDERIV%dExfil_dDrive                  ! derivative of exfiltration w.r.t. the column surplus it returns
+  case('dLatInflowNrg_dTemp'            ); get_ixDeriv = iLookDERIV%dLatInflowNrg_dTemp            ! derivative of the lateral inflow energy source w.r.t. layer temperature
+  case('dSoilAdv_dTemp'                 ); get_ixDeriv = iLookDERIV%dSoilAdv_dTemp                 ! derivative of the soil advective energy source w.r.t. layer temperature
+  case('dSoilAdv_dTempAbove'            ); get_ixDeriv = iLookDERIV%dSoilAdv_dTempAbove            ! derivative of the soil advective energy source w.r.t. temperature above
+  case('dSoilAdv_dTempBelow'            ); get_ixDeriv = iLookDERIV%dSoilAdv_dTempBelow            ! derivative of the soil advective energy source w.r.t. temperature below
+  case('dSoilAdv_dNet'                  ); get_ixDeriv = iLookDERIV%dSoilAdv_dNet                   ! derivative of the soil advective energy source w.r.t. the net water source of the layer
+  case('dSoilAdv_dqAbove'               ); get_ixDeriv = iLookDERIV%dSoilAdv_dqAbove                ! derivative of the soil advective energy source w.r.t. the water flux through the top of the layer
+  case('dSoilAdv_dqBelow'               ); get_ixDeriv = iLookDERIV%dSoilAdv_dqBelow                ! derivative of the soil advective energy source w.r.t. the water flux through the base of the layer
+  case('dCanopyAdv_dNet'                ); get_ixDeriv = iLookDERIV%dCanopyAdv_dNet                 ! derivative of the canopy advective energy source w.r.t. the net canopy liquid flux
+  case('dSoilAdv_dCanLiq'               ); get_ixDeriv = iLookDERIV%dSoilAdv_dCanLiq                ! derivative of the top soil layer advective energy source w.r.t. canopy liquid water
 
   case default
    get_ixDeriv = integerMissing
@@ -997,6 +1022,7 @@ contains
   case('numberDomainSplitNrg' ); get_ixINDEX = iLookINDEX%numberDomainSplitNrg  ! number of domain splitting solutions for energy                         (-)
   case('numberDomainSplitMass'); get_ixINDEX = iLookINDEX%numberDomainSplitMass ! number of domain splitting solutions for mass                           (-)
   case('numberScalarSolutions'); get_ixINDEX = iLookINDEX%numberScalarSolutions ! number of scalar solutions                                              (-)
+  case('domType'              ); get_ixINDEX = iLookINDEX%domType               ! horizontal domain type (upland, glacier, wetland, stream)                (-)
   ! default
   case default
    get_ixIndex = integerMissing
@@ -1031,6 +1057,9 @@ contains
   case('wallErosionRate'          ); get_ixBpar = iLookBPAR%wallErosionRate           ! glacier wall erosion rate input for debris advection (mm yr-1)
   case('debrisCritStress'         ); get_ixBpar = iLookBPAR%debrisCritStress          ! critical driving stress where debris slides on terminal wedge (Pa)
   case('latMoraineWidth'          ); get_ixBpar = iLookBPAR%latMoraineWidth           ! lateral moraine width or rockfall length (m)
+  case('glenAFactor'              ); get_ixBpar = iLookBPAR%glenAFactor               ! multiplier on Glen's rate factor A (-)
+  case('mbGradAbove'              ); get_ixBpar = iLookBPAR%mbGradAbove               ! mass balance gradient above the highest glacier domain (mm w.e. m-1 yr-1)
+  case('mbGradBelow'              ); get_ixBpar = iLookBPAR%mbGradBelow               ! mass balance gradient below the lowest glacier domain (mm w.e. m-1 yr-1)
   ! get to here if cannot find the variable
   case default
    get_ixBpar = integerMissing
@@ -1077,6 +1106,7 @@ contains
   case('glacSnowRunoffFuture'          ); get_ixBvar = iLookBVAR%glacSnowRunoffFuture            ! per glacier snow reservoir runoff in future time steps (m s-1)
   case('glacFirnRunoffFuture'          ); get_ixBvar = iLookBVAR%glacFirnRunoffFuture            ! per glacier firn reservoir runoff in future time steps (m s-1)
   case('glacierRoutedRunoff'           ); get_ixBvar = iLookBVAR%glacierRoutedRunoff             ! lapsed glacier runoff (m s-1)
+  case('basin__GlacierMassChange'      ); get_ixBvar = iLookBVAR%basin__GlacierMassChange        ! glacier mass change per unit glacier area (kg m-2 s-1)
   ! get to here if cannot find the variable
   case default
    get_ixBvar = integerMissing

@@ -23,6 +23,7 @@ module soilLiqFlux_module
 
 ! data types
 USE nr_type
+USE scratch_module,only:sizeScratch        ! size the per-thread scratch arrays
 USE data_types,only:&
                    var_ilength,           & ! x%var(:)%dat   (i4b)
                    var_dlength,           & ! x%var(:)%dat   (rkind)
@@ -92,10 +93,26 @@ USE mDecisions_module,only:   &
 implicit none
 private
 public::soilLiqFlux
+public::compressionLimiter
 
 ! flag to denote if updating infiltration during iterations for testing purposes
 logical(lgt),parameter :: updateInfil=.true.
+! compression closure of the infiltrating area under positive pressure
+real(rkind),parameter :: compHeadWidth =0.05_rkind ! pressure-head scale of the Gaussian compression closure (m)
 contains
+
+! ***************************************************************************************************************
+! public subroutine compressionLimiter: the fraction of the infiltrating area left open under a mean squared
+! positive head (m2), and its derivative w.r.t. that mean (m-2)
+! ***************************************************************************************************************
+pure subroutine compressionLimiter(meanSqHead,limiter,dLimiter_dHead)
+  real(rkind),intent(in)  :: meanSqHead      ! depth-weighted mean of squared positive pressure head over the zone (m2)
+  real(rkind),intent(out) :: limiter         ! fraction of the infiltrating area left open (-)
+  real(rkind),intent(out) :: dLimiter_dHead  ! derivative w.r.t. the mean squared positive head (m-2)
+  ! for uniform head, limiter falls to exp(-1) at compHeadWidth, and is effectively zero at 3*compHeadWidth
+  limiter = exp(-meanSqHead/compHeadWidth**2_i4b)
+  dLimiter_dHead = -limiter/compHeadWidth**2_i4b
+end subroutine compressionLimiter
 
 ! ***************************************************************************************************************
 ! public subroutine soilLiqFlux: compute liquid water fluxes and their derivatives
@@ -134,22 +151,27 @@ subroutine soilLiqFlux(&
   integer(i4b)                                     :: nGlce               ! number of glacier ice layers
   integer(i4b)                                     :: ibeg,iend           ! start and end indices of the soil layers in concatanated snow-lake-soil-glce vector
   integer(i4b)                                     :: iLayer,iSoil        ! index of soil layer
-  integer(i4b)                                     :: ixLayerDesired(1)   ! layer desired (scalar solution)
   integer(i4b)                                     :: ixTop               ! top layer in subroutine call
   integer(i4b)                                     :: ixBot               ! bottom layer in subroutine call
   ! transpiration sink term
-  real(rkind),dimension(in_soilLiqFlux % nSoil)    :: mLayerTranspireFrac ! fraction of transpiration allocated to each soil layer (-)
+  real(rkind),allocatable,save,dimension(:)        :: mLayerTranspireFrac ! fraction of transpiration allocated to each soil layer (-)
+  real(rkind)                                      :: aquiferTranspireFrac ! fraction of transpiration taken from below the soil column (-)
   ! diagnostic variables
-  real(rkind),dimension(in_soilLiqFlux % nSoil)    :: iceImpedeFac        ! ice impedence factor at layer mid-points (-)
-  real(rkind),dimension(in_soilLiqFlux % nSoil)    :: dHydCond_dTemp      ! derivative in hydraulic conductivity w.r.t temperature (m s-1 K-1)
-  real(rkind),dimension(0:in_soilLiqFlux % nSoil)  :: iLayerHydCond       ! hydraulic conductivity at layer interface (m s-1)
+  real(rkind),allocatable,save,dimension(:)        :: iceImpedeFac        ! ice impedence factor at layer mid-points (-)
+  real(rkind),allocatable,save,dimension(:)        :: dHydCond_dTemp      ! derivative in hydraulic conductivity w.r.t temperature (m s-1 K-1)
+  real(rkind),allocatable,save,dimension(:)        :: iLayerHydCond       ! hydraulic conductivity at layer interface (m s-1)
   ! compute surface flux
   integer(i4b)                                     :: nRoots              ! number of soil layers with roots or layers that take infiltration
   integer(i4b)                                     :: ixIce               ! index of the lowest soil layer that contains ice
-  real(rkind),dimension(0:in_soilLiqFlux % nSoil)  :: iLayerHeight        ! height of the layer interfaces (m)
+  real(rkind),allocatable,save,dimension(:)        :: iLayerHeight        ! height of the layer interfaces (m)
   ! error control
   logical(lgt)                                     :: return_flag         ! flag for return statements
+  ! one copy of the scratch arrays per thread
+  !$omp threadprivate(mLayerTranspireFrac, iceImpedeFac, dHydCond_dTemp, iLayerHydCond, iLayerHeight)
   ! -------------------------------------------------------------------------------------------------------------------------------------------------
+
+  call sizeScratch(1,in_soilLiqFlux%nSoil,mLayerTranspireFrac,iceImpedeFac,dHydCond_dTemp)
+  call sizeScratch(0,in_soilLiqFlux%nSoil,iLayerHydCond,iLayerHeight)
 
   ! ** Initialize indices, error control, and get layer information **
   call initialize_soilLiqFlux; if (return_flag) return
@@ -193,9 +215,8 @@ contains
    ixSoilOnlyHyd  => indx_data%var(iLookINDEX%ixSoilOnlyHyd)%dat & ! intent(in): index in the state subset for hydrology state variables in the soil domain
   &)
    if (scalarSolution) then
-     ixLayerDesired = pack(ixMatricHead, ixSoilOnlyHyd/=integerMissing)
-     ixTop = ixLayerDesired(1)
-     ixBot = ixLayerDesired(1)
+     ixTop = ixMatricHead(findloc(ixSoilOnlyHyd/=integerMissing, .true., 1)) ! first soil layer with a hydrology state in the subset
+     ixBot = ixTop
    else
      ixTop = 1
      ixBot = nSoil
@@ -283,12 +304,18 @@ contains
  subroutine finalize_transpiration_loss_fraction
   ! **** Finalize operations for the fraction of transpiration loss from each soil layer *****
   associate(&
+   scalarTranspireLim     => diag_data%var(iLookDIAG%scalarTranspireLim)%dat(1),     & ! intent(in): weighted average of the transpiration limiting factor (-)
+   scalarTranspireLimAqfr => diag_data%var(iLookDIAG%scalarTranspireLimAqfr)%dat(1), & ! intent(in): transpiration limiting factor for the aquifer (-)
+   scalarAquiferRootFrac  => diag_data%var(iLookDIAG%scalarAquiferRootFrac)%dat(1),  & ! intent(in): fraction of roots below the soil profile (-)
    err          => out_soilLiqFlux % err,     & ! intent(out): error code
    message      => out_soilLiqFlux % cmessage & ! intent(out): error message
   &)
-   ! check fractions sum to one
-   if (abs(sum(mLayerTranspireFrac) - 1._rkind) > verySmaller) then
-     message=trim(message)//'fraction transpiration in soil layers does not sum to one'; err=20; return_flag=.true.; return
+   ! soil-layer fractions plus the aquifer's share account for all transpiration
+   aquiferTranspireFrac = 0._rkind
+   if (scalarTranspireLim > tiny(scalarTranspireLim)) &
+     aquiferTranspireFrac = scalarAquiferRootFrac*scalarTranspireLimAqfr/scalarTranspireLim
+   if (abs(sum(mLayerTranspireFrac) + aquiferTranspireFrac - 1._rkind) > verySmaller) then
+     message=trim(message)//'fraction transpiration in soil layers and aquifer does not sum to one'; err=20; return_flag=.true.; return
    end if
   end associate
  end subroutine finalize_transpiration_loss_fraction
@@ -380,6 +407,8 @@ contains
   type(in_type_surfaceFlux)  ::  in_surfaceFlux
   type(io_type_surfaceFlux)  ::  io_surfaceFlux
   type(out_type_surfaceFlux) :: out_surfaceFlux
+  save :: in_surfaceFlux, out_surfaceFlux ! one copy per thread, so arrays are reallocated only when nSoil changes
+  !$omp threadprivate(in_surfaceFlux, out_surfaceFlux)
 
   call initialize_compute_surface_infiltration(in_surfaceFlux,io_surfaceFlux)
 
@@ -391,7 +420,7 @@ contains
 
  subroutine initialize_compute_surface_infiltration(in_surfaceFlux,io_surfaceFlux)
   ! **** Initialize operations for compute_surface_infiltration ****
-  type(in_type_surfaceFlux),intent(out) :: in_surfaceFlux
+  type(in_type_surfaceFlux),intent(inout) :: in_surfaceFlux
   type(io_type_surfaceFlux),intent(out) :: io_surfaceFlux
   ! set derivative w.r.t. state above to zero (does not exist)
   associate(&
@@ -414,7 +443,7 @@ contains
   ! **** Update operations for compute_surface_infiltration ****
   type(in_type_surfaceFlux) ,intent(in)    :: in_surfaceFlux
   type(io_type_surfaceFlux) ,intent(inout) :: io_surfaceFlux
-  type(out_type_surfaceFlux),intent(out)   :: out_surfaceFlux
+  type(out_type_surfaceFlux),intent(inout) :: out_surfaceFlux
   call surfaceFlux(io_soilLiqFlux,in_surfaceFlux,io_surfaceFlux,out_surfaceFlux)
  end subroutine update_compute_surface_infiltration
 
@@ -463,6 +492,12 @@ contains
    call finalize_compute_interface_fluxes_derivatives(out_iLayerFlux); if (return_flag) return
 
   end do
+
+  ! a scalar solution holds the flux into its layer from above, so that flux does not respond to the layer's state
+  if (in_soilLiqFlux % scalarSolution .and. ixTop>1) then
+   io_soilLiqFlux % dq_dHydStateBelow(ixTop-1) = 0._rkind
+   io_soilLiqFlux % dq_dNrgStateBelow(ixTop-1) = 0._rkind
+  end if
  end subroutine compute_interface_fluxes_derivatives
 
  subroutine initialize_compute_interface_fluxes_derivatives(in_iLayerFlux)
@@ -566,6 +601,7 @@ subroutine diagv_node(in_diagv_node,out_diagv_node)
   USE soil_utils_module,only:dPsi_dTheta          ! compute derivative of the soil moisture characteristic w.r.t. theta (m)
   USE soil_utils_module,only:dHydCond_dPsi        ! compute derivative in hydraulic conductivity w.r.t. matric head (s-1)
   USE soil_utils_module,only:dIceImpede_dTemp     ! compute the derivative in the ice impedance factor w.r.t. temperature (K-1)
+  USE soil_utils_module,only:dVolFracTot_dPsi     ! derivative of the smoothed retention curve w.r.t. matric head (m-1)
   ! compute hydraulic transmittance and derivatives for all layers
   implicit none
   ! input: model control, variables, derivatives, and parameters
@@ -581,6 +617,8 @@ subroutine diagv_node(in_diagv_node,out_diagv_node)
   real(rkind)                      :: dHydCondMicro_dMatric     ! derivative in hydraulic conductivity of micropores w.r.t matric head (s-1)
   real(rkind)                      :: dHydCondMicro_dTemp       ! derivative in hydraulic conductivity of micropores w.r.t temperature (m s-1 K-1)
   real(rkind)                      :: dIceImpede_dLiq           ! derivative in ice impedence factor w.r.t. volumetric liquid water content (-)
+  real(rkind)                      :: dIce_dPsiLiq              ! derivative in volumetric ice w.r.t. liquid matric head at fixed temperature (m-1)
+  real(rkind)                      :: availPore                 ! pore space not filled by ice, above residual (-)
   real(rkind)                      :: hydCond_noIce             ! hydraulic conductivity in the absence of ice (m s-1)
   real(rkind)                      :: dK_dPsi__noIce            ! derivative in hydraulic conductivity w.r.t matric head, in the absence of ice (s-1)
   real(rkind)                      :: relSatMP                  ! relative saturation of macropores (-)
@@ -665,6 +703,7 @@ contains
    ! input: state and diagnostic variables
    scalarMatricHeadLiqTrial => in_diagv_node % scalarMatricHeadLiqTrial, & ! liquid matric head in each layer (m)
    scalarVolFracIceTrial    => in_diagv_node % scalarVolFracIceTrial   , & ! volumetric fraction of ice in a given layer (-)
+   scalarVolFracLiqTrial    => in_diagv_node % scalarVolFracLiqTrial   , & ! volumetric fraction of liquid water in a given layer (-)
    ! input: pre-computed derivatives
    dTheta_dTk    => in_diagv_node % dTheta_dTk   , & ! derivative in volumetric liquid water content w.r.t. temperature (K-1)
    dPsiLiq_dTemp => in_diagv_node % dPsiLiq_dTemp, & ! derivative in liquid water matric potential w.r.t. temperature (m K-1)
@@ -713,7 +752,12 @@ contains
    if (scalarVolFracIceTrial > verySmaller) then
      dK_dPsi__noIce        = dHydCond_dPsi(scalarMatricHeadLiqTrial,scalarSatHydCond,vGn_alpha,vGn_n,vGn_m)
      dHydCondMicro_dTemp   = dPsiLiq_dTemp*dK_dPsi__noIce  ! m s-1 K-1
-     dHydCondMicro_dMatric = hydCond_noIce*dIceImpede_dLiq*scalardTheta_dPsi + dK_dPsi__noIce*iceImpedeFac
+     ! at fixed temperature more total water is more ice, which raises the liquid head (liquidHead) and the impedance
+     availPore    = theta_sat - scalarVolFracIceTrial - theta_res
+     dIce_dPsiLiq = 0._rkind
+     if (scalarVolFracLiqTrial - theta_res > verySmaller) &
+       dIce_dPsiLiq = availPore**2_i4b/(scalarVolFracLiqTrial - theta_res)*dVolFracTot_dPsi(scalarMatricHeadLiqTrial,vGn_alpha,0._rkind,1._rkind,vGn_n,vGn_m)
+     dHydCondMicro_dMatric = -hydCond_noIce*log(10._rkind)*f_impede*iceImpedeFac*dIce_dPsiLiq + dK_dPsi__noIce*iceImpedeFac
    else
      dHydCondMicro_dTemp   = 0._rkind
      dHydCondMicro_dMatric = dHydCond_dPsi(scalarMatricHeadLiqTrial,scalarSatHydCond,vGn_alpha,vGn_n,vGn_m)
@@ -752,6 +796,7 @@ subroutine surfaceFlux(io_soilLiqFlux,in_surfaceFlux,io_surfaceFlux,out_surfaceF
   USE soil_utils_module,only:hydCond_psi           ! compute hydraulic conductivity as a function of matric head (m s-1)
   USE soil_utils_module,only:crit_soilT            ! compute critical temperature below which ice exists
   USE soil_utils_module,only:gammp,gammp_complex   ! compute the regularized lower incomplete Gamma function
+  USE soil_utils_module,only:dgammp_dx             ! compute the derivative of the regularized lower incomplete Gamma function
   ! compute infiltraton at the surface and its derivative w.r.t. mass in the upper soil layer
   implicit none
   ! -----------------------------------------------------------------------------------------------------------------------------
@@ -762,17 +807,17 @@ subroutine surfaceFlux(io_soilLiqFlux,in_surfaceFlux,io_surfaceFlux,out_surfaceF
   ! input-output: hydraulic conductivity and diffusivity, and infiltration parameters
   type(io_type_surfaceFlux) ,intent(inout) :: io_surfaceFlux          ! input object for surfaceFlux
   ! output: runoff, infiltration, derivatives, and error control
-  type(out_type_surfaceFlux),intent(out)   :: out_surfaceFlux         ! output object for surfaceFlux
+  type(out_type_surfaceFlux),intent(inout) :: out_surfaceFlux         ! output object for surfaceFlux
   ! -----------------------------------------------------------------------------------------------------------------------------
   ! local variables
   ! general
   integer(i4b)                     :: iLayer                              ! index of soil layer
   real(rkind)                      :: Tcrit                               ! temperature where all water is unfrozen (K)
   real(rkind)                      :: fPart1,fPart2                       ! different parts of a function
-  real(rkind)                      :: dPart1(1:in_surfaceFlux % nSoil)    ! derivatives for different parts of a function
-  real(rkind)                      :: dPart2(1:in_surfaceFlux % nSoil)    ! derivatives for different parts of a function
-  real(rkind)                      :: dfracCap(1:in_surfaceFlux % nSoil)  ! derivatives for different parts of a function
-  real(rkind)                      :: dfInfRaw(1:in_surfaceFlux % nSoil)  ! derivatives for different parts of a function
+  real(rkind),allocatable,save     :: dPart1(:)                           ! derivatives for different parts of a function
+  real(rkind),allocatable,save     :: dPart2(:)                           ! derivatives for different parts of a function
+  real(rkind),allocatable,save     :: dfracCap(:)                         ! derivatives for different parts of a function
+  real(rkind),allocatable,save     :: dfInfRaw(:)                         ! derivatives for different parts of a function
   real(rkind)                      :: total_soil_depth                    ! total depth of soil (m)
   integer(i4b)                     :: ixInfRateMax_use                    ! topmodel_GA choice of the maximum infiltration rate for glacier domains
   integer(i4b)                     :: ix_hc_profile_use                   ! hydraulic conductivity profile used to shape the topmodel_GA infiltration rate
@@ -792,10 +837,11 @@ subroutine surfaceFlux(io_soilLiqFlux,in_surfaceFlux,io_surfaceFlux,out_surfaceF
   real(rkind)                      :: fInfRaw                             ! infiltrating area before imposing solution constraints (-)
   real(rkind),parameter            :: maxFracCap=0.995_rkind              ! maximum fraction capacity -- used to avoid numerical problems associated with an enormous derivative
   real(rkind),parameter            :: scaleFactor=0.000001_rkind          ! scale factor for the smoothing function (-)
-  real(rkind),parameter            :: qSurfScaleMax=1000._rkind           ! maximum surface runoff scaling factor (-)
+  real(rkind),parameter            :: qSurfScaleMax=1000._rkind           ! maximum shape of the infiltration area (-)
   ! fraction of impermeable area associated with frozen ground
   real(rkind)                      :: alpha                               ! shape parameter in the Gamma distribution
   real(rkind)                      :: xLimg                               ! upper limit of the integral
+  real(rkind)                      :: dFrozenArea_dRootZoneIce            ! derivative in the frozen area w.r.t. the depth of ice in the root zone (m-1)
   ! FUSE
   real(rkind),parameter            :: alpha_LSE=1.e3_rkind                ! smoothness parameter for LSE smoother function
   real(rkind),parameter            :: roundoff_tolerance = 1.e2_rkind * epsilon(1._rkind) ! tolerance for round-off error is near machine epsilon 
@@ -823,26 +869,44 @@ subroutine surfaceFlux(io_soilLiqFlux,in_surfaceFlux,io_surfaceFlux,out_surfaceF
   real(rkind)                      :: n_topmodel                          ! TOPMODEL exponent exponent (must be sufficiently large to avoid divergence of lambda_n -- n>=3.5 or so)
   complex(rkind)                   :: lambda_n                            ! mean of the power-transformed topographic index
   ! derivatives
-  real(rkind) :: dVolFracLiq_dWat(1:in_surfaceFlux % nSoil)  ! ... vol fraction of liquid w.r.t. water state variable in soil layers
-  real(rkind) :: dVolFracIce_dWat(1:in_surfaceFlux % nSoil)  ! ... vol fraction of ice w.r.t. water state variable in soil layers
-  real(rkind) :: dVolFracLiq_dTk(1:in_surfaceFlux % nSoil)   ! ... vol fraction of liquid w.r.t. temperature in soil layers
-  real(rkind) :: dVolFracIce_dTk(1:in_surfaceFlux % nSoil)   ! ... vol fraction of ice w.r.t. temperature in soil layers
-  real(rkind) :: dRootZoneLiq_dWat(1:in_surfaceFlux % nSoil) ! ... vol fraction of scalar root zone liquid w.r.t. water state variable in root layers
-  real(rkind) :: dRootZoneIce_dWat(1:in_surfaceFlux % nSoil) ! ... vol fraction of scalar root zone ice w.r.t. water state variable in root layers
-  real(rkind) :: dRootZoneLiq_dTk(1:in_surfaceFlux % nSoil)  ! ... vol fraction of scalar root zone liquid w.r.t. temperature in root layers
-  real(rkind) :: dRootZoneIce_dTk(1:in_surfaceFlux % nSoil)  ! ... vol fraction of scalar root zone ice w.r.t. temperature in root layers
-  real(rkind) :: dDepthWettingFront_dWat(1:in_surfaceFlux % nSoil) ! ... scalar depth of wetting front w.r.t. water state variable in root layers
-  real(rkind) :: dDepthWettingFront_dTk(1:in_surfaceFlux % nSoil)  ! ... scalar depth of wetting front w.r.t. temperature in root layers
-  real(rkind) :: dxMaxInfilRate_dWat(1:in_surfaceFlux % nSoil) ! ... scalar max infiltration rate w.r.t. water state variable in root layers
-  real(rkind) :: dxMaxInfilRate_dTk(1:in_surfaceFlux % nSoil)  ! ... scalar max infiltration rate w.r.t. temperature in root layers
-  real(rkind) :: dInfilArea_dWat(1:in_surfaceFlux % nSoil)  ! ... scalar infiltration rate w.r.t. water state variable in soil layers
-  real(rkind) :: dInfilArea_dTk(1:in_surfaceFlux % nSoil)   ! ... scalar infiltration rate w.r.t. temperature in soil layers
-  real(rkind) :: dFrozenArea_dWat(1:in_surfaceFlux % nSoil) ! ... scalar frozen area w.r.t. water state variable in soil layers
-  real(rkind) :: dFrozenArea_dTk(1:in_surfaceFlux % nSoil)  ! ... scalar frozen area w.r.t. temperature in soil layers
-  real(rkind) :: dInfilRate_dWat(1:in_surfaceFlux % nSoil)  ! ... scalar infiltration rate w.r.t. water state variable in soil layers
-  real(rkind) :: dInfilRate_dTk(1:in_surfaceFlux % nSoil)   ! ... scalar infiltration rate w.r.t. temperature in soil layers
+  real(rkind),allocatable,save :: dVolFracLiq_dWat(:)             ! ... vol fraction of liquid w.r.t. water state variable in soil layers
+  real(rkind),allocatable,save :: dVolFracIce_dWat(:)             ! ... vol fraction of ice w.r.t. water state variable in soil layers
+  real(rkind),allocatable,save :: dVolFracLiq_dTk(:)              ! ... vol fraction of liquid w.r.t. temperature in soil layers
+  real(rkind),allocatable,save :: dVolFracIce_dTk(:)              ! ... vol fraction of ice w.r.t. temperature in soil layers
+  real(rkind),allocatable,save :: dRootZoneLiq_dWat(:)            ! ... vol fraction of scalar root zone liquid w.r.t. water state variable in root layers
+  real(rkind),allocatable,save :: dRootZoneIce_dWat(:)            ! ... vol fraction of scalar root zone ice w.r.t. water state variable in root layers
+  real(rkind),allocatable,save :: dRootZoneLiq_dTk(:)             ! ... vol fraction of scalar root zone liquid w.r.t. temperature in root layers
+  real(rkind),allocatable,save :: dRootZoneIce_dTk(:)             ! ... vol fraction of scalar root zone ice w.r.t. temperature in root layers
+  real(rkind),allocatable,save :: dDepthWettingFront_dWat(:)            ! ... scalar depth of wetting front w.r.t. water state variable in root layers
+  real(rkind),allocatable,save :: dDepthWettingFront_dTk(:)             ! ... scalar depth of wetting front w.r.t. temperature in root layers
+  real(rkind),allocatable,save :: dxMaxInfilRate_dWat(:)            ! ... scalar max infiltration rate w.r.t. water state variable in root layers
+  real(rkind),allocatable,save :: dxMaxInfilRate_dTk(:)             ! ... scalar max infiltration rate w.r.t. temperature in root layers
+  real(rkind),allocatable,save :: dInfilArea_dWat(:)             ! ... scalar infiltration rate w.r.t. water state variable in soil layers
+  real(rkind),allocatable,save :: dInfilArea_dTk(:)              ! ... scalar infiltration rate w.r.t. temperature in soil layers
+  real(rkind),allocatable,save :: dFrozenArea_dWat(:)            ! ... scalar frozen area w.r.t. water state variable in soil layers
+  real(rkind),allocatable,save :: dFrozenArea_dTk(:)             ! ... scalar frozen area w.r.t. temperature in soil layers
+  real(rkind),allocatable,save :: dInfilRate_dWat(:)             ! ... scalar infiltration rate w.r.t. water state variable in soil layers
+  real(rkind),allocatable,save :: dInfilRate_dTk(:)              ! ... scalar infiltration rate w.r.t. temperature in soil layers
+  real(rkind),allocatable,save :: dS1_dLiq(:)                    ! ... upper-layer storage S1 w.r.t. liquid water content in soil layers
+  real(rkind),allocatable,save :: dS1_T_dLiq(:)                  ! ... tension storage S1_T w.r.t. liquid water content in soil layers
+  real(rkind),allocatable,save :: posHead(:)                     ! smooth positive part of matric head in soil layers (m)
+  real(rkind),allocatable,save :: dPosHead_dPsi(:)               ! ... smooth positive head w.r.t. matric head in soil layers (-)
+  real(rkind),allocatable,save :: dCompHead_dWat(:)              ! ... mean squared positive head w.r.t. hydrology state in soil layers (m)
   ! error control
   logical(lgt) :: return_flag ! logical flag for return statements
+  ! one copy of the scratch arrays per thread
+  !$omp threadprivate(dPart1, dPart2, dfracCap, dfInfRaw, dVolFracLiq_dWat, dVolFracIce_dWat, dVolFracLiq_dTk, &
+  !$omp& dVolFracIce_dTk, dRootZoneLiq_dWat, dRootZoneIce_dWat, dRootZoneLiq_dTk, dRootZoneIce_dTk, &
+  !$omp& dDepthWettingFront_dWat, dDepthWettingFront_dTk, dxMaxInfilRate_dWat, dxMaxInfilRate_dTk, dInfilArea_dWat, &
+  !$omp& dInfilArea_dTk, dFrozenArea_dWat, dFrozenArea_dTk, dInfilRate_dWat, dInfilRate_dTk, dS1_dLiq, dS1_T_dLiq, &
+  !$omp& posHead, dPosHead_dPsi, dCompHead_dWat)
+
+  call sizeScratch(1,in_surfaceFlux%nSoil,dPart1, dPart2, dfracCap, dfInfRaw, dVolFracLiq_dWat, dVolFracIce_dWat, &
+                  &dVolFracLiq_dTk, dVolFracIce_dTk, dRootZoneLiq_dWat, dRootZoneIce_dWat, dRootZoneLiq_dTk, &
+                  &dRootZoneIce_dTk, dDepthWettingFront_dWat, dDepthWettingFront_dTk, dxMaxInfilRate_dWat, &
+                  &dxMaxInfilRate_dTk, dInfilArea_dWat, dInfilArea_dTk, dFrozenArea_dWat, dFrozenArea_dTk)
+  call sizeScratch(1,in_surfaceFlux%nSoil,dInfilRate_dWat, dInfilRate_dTk, dS1_dLiq, dS1_T_dLiq, posHead, &
+                  &dPosHead_dPsi, dCompHead_dWat)
 
   call initialize_surfaceFlux
 
@@ -1008,7 +1072,6 @@ subroutine update_volFracLiq_derivatives
   ! **** updates the derivatives for volumetric fraction of liquid and ice water in each soil layer ****
   ! local variables
   integer(i4b)      :: nLayers         ! number of soil layers to process
-  logical(lgt)      :: doIce           ! flag indicating whether ice derivatives are needed
 
   associate(&
    ! input: model control
@@ -1026,43 +1089,27 @@ subroutine update_volFracLiq_derivatives
    message  => out_surfaceFlux % message  & ! error message
   &)
 
-   ! determine number of layers to process and whether ice derivatives are needed
-   if (surfRun_SE ==homegrown_SE) then ! need only root zone derivatives but need ice derivatives
+  ! decide how many layers to process for the derivatives
+   if (surfRun_SE == homegrown_SE .or. surfRun_SE == zero_SE) then ! only root zone derivatives needed
      nLayers = nRoots
-     doIce = .true.
-   else ! might need entire soil column (FUSE methods), might need ice derivatives (infiltration excess method)
-     if (ixInfRateMax_use == noInfiltrationExcess) then
-       if (surfRun_SE ==zero_SE) then ! no derivatives needed
-         nLayers = 0
-         doIce = .false.
-       else ! FUSE methods do not need ice derivatives
-         nLayers = nSoil
-         doIce = .false.
-       end if
-     else ! infiltration excess method needs ice derivatives in root zone
-       if (surfRun_SE == zero_SE) then ! only need root zone derivatives
-         nLayers = nRoots
-         doIce = .true.
-       else ! FUSE methods need soil column derivatives, will compute unused ice derivatives for layers beyond root zone 
-         nLayers = nSoil
-         doIce = .true.
-       end if
-     end if ! (if ixInfRateMax_use)
-   end if ! (if homegrown_SE)
+   else ! FUSE methods need soil column liquid derivatives, ice beyond root zone is unused
+     nLayers = nSoil
+   end if
 
+   ! compute the derivatives in volumetric fraction of liquid and ice water w.r.t. water and energy state variables
    if (nLayers > 0) then
      do iLayer=1,nLayers
        Tcrit = crit_soilT( mLayerMatricHead(iLayer) )
        if (mLayerTemp(iLayer) < Tcrit) then
          dVolFracLiq_dWat(iLayer) = 0._rkind
-         if(doIce) dVolFracIce_dWat(iLayer) = dTheta_dPsi(iLayer)
+         dVolFracIce_dWat(iLayer) = dTheta_dPsi(iLayer)
        else
          dVolFracLiq_dWat(iLayer) = dTheta_dPsi(iLayer)
-         if(doIce) dVolFracIce_dWat(iLayer) = 0._rkind
+         dVolFracIce_dWat(iLayer) = 0._rkind
        end if
      end do
      dVolFracLiq_dTk(:) = dTheta_dTk(:) ! already zeroed out if not below critical temperature
-     if(doIce) dVolFracIce_dTk(:) = -dVolFracLiq_dTk(:) ! often can and will simplify one of these terms out
+     dVolFracIce_dTk(:) = -dVolFracLiq_dTk(:) ! often can and will simplify one of these terms out
    end if
 
   end associate
@@ -1074,10 +1121,7 @@ subroutine update_volFracLiq_derivatives
   use soil_utils_module,only:SoftArgMax ! smooth arg max/min (for derivatives of LogSumExp)
 
   ! local variables
-  real(rkind)           :: dS1_dLiq(1:in_surfaceFlux % nSoil)       ! derivative of S1 w.r.t. liquid water content
-  real(rkind)           :: S1_T_derivatives(1:2)                    ! array of derivatives for S1_T
   real(rkind)           :: dS1_T_dS1                                ! derivative of S1_T w.r.t S1
-  real(rkind)           :: dS1_T_dLiq(1:in_surfaceFlux % nSoil)     ! derivative of S1_T w.r.t liquid water content
 
   associate(&
    nSoil            => in_surfaceFlux % nSoil,            & ! number of soil layers
@@ -1105,9 +1149,9 @@ subroutine update_volFracLiq_derivatives
    if (S1 <= 0._rkind) then; io_surfaceFlux % scalarInfilArea = 1._rkind; return; end if ! if no water, unsaturated and all area infiltrates
    S1_max = total_soil_depth * theta_sat                ! max water storage for upper FUSE layer (m)
 
-  ! compute tension water content
+   ! compute tension water content
    S1_T_max = phi_tens * S1_max
-   S1_T     = LogSumExp(-alpha_LSE,[S1,S1_T_max],err) ! smooth approximation to S1_T=min(S1,S1_T_max)
+   S1_T     = LogSumExp(-alpha_LSE,S1,S1_T_max,err) ! smooth approximation to S1_T=min(S1,S1_T_max)
    if(err/=0)then; err=10; message=trim(message)//"FUSE PRMS surface runoff: error in LogSumExp"; return_flag=.true.; return; end if
    if (S1_T < 0._rkind) then ! check for errors
     err=10; message=trim(message)//"FUSE PRMS surface runoff: S1_T is negative (may need to adjust magnitude of alpha_LSE)"; return_flag=.true.; return
@@ -1118,8 +1162,7 @@ subroutine update_volFracLiq_derivatives
    ! define the derivatives
    if(updateInfil)then
      dS1_dLiq           = mLayerDepth(:)
-     S1_T_derivatives   = SoftArgMax(-alpha_LSE,[S1,S1_T_max])
-     dS1_T_dS1          = S1_T_derivatives(1) 
+     dS1_T_dS1          = SoftArgMax(-alpha_LSE,S1,S1_T_max)
      dS1_T_dLiq         = dS1_T_dS1 * dS1_dLiq(:)
      dInfilArea_dWat(:) = -(dS1_T_dLiq(:)/S1_T_max)*SatArea_max * dVolFracLiq_dWat(:)     
      dInfilArea_dTk(:)  = -(dS1_T_dLiq(:)/S1_T_max)*SatArea_max * dVolFracLiq_dTk(:)          
@@ -1134,10 +1177,8 @@ subroutine update_volFracLiq_derivatives
   use soil_utils_module,only:SoftArgMax ! smooth arg max/min (for derivatives of LogSumExp)
 
   ! local variables
-  real(rkind)            :: dS1_dLiq(1:in_surfaceFlux % nSoil)     ! derivative of S1 w.r.t. liquid water content
   real(rkind)            :: dS1_star_dS1                           ! derivative in S1_star w.r.t S1
   real(rkind)            :: dbase_dS1                              ! derivative of base w.r.t S1
-  real(rkind)            :: S1_star_derivatives(1:2)               ! array of derivatives for S1_star from SoftArgMax function
 
   associate(&
    nSoil            => in_surfaceFlux % nSoil,            & ! number of soil layers
@@ -1164,7 +1205,7 @@ subroutine update_volFracLiq_derivatives
    ! Optional: smoothed to prevent negative bases using a smooth approximation of S1_star = min(S1,S1_max)
    !           (Smoothed SatArea) = 1 - (1-S1_star/S1_max)**b_arnovic 
    if (smoother) then ! with smooth approximation of min(S1,S1_max)
-    S1_star = LogSumExp(-alpha_LSE,[S1,S1_max],err) ! smooth approximation of min(S1,S1_max) to prevent negative bases
+    S1_star = LogSumExp(-alpha_LSE,S1,S1_max,err) ! smooth approximation of min(S1,S1_max) to prevent negative bases
     if(err/=0)then; err=10; message=trim(message)//"FUSE ARNO/VIC surface runoff: error in LogSumExp"; return_flag=.true.; return; end if
    else               ! no smoothing
     S1_star = S1
@@ -1189,14 +1230,13 @@ subroutine update_volFracLiq_derivatives
    
    ! define the derivatives
    if(updateInfil)then
-   ! compute derivatives needed for infiltration derivative
+     ! compute derivatives needed for infiltration derivative
      dS1_dLiq = mLayerDepth(:)
-   if (smoother) then ! with smooth approximation of min(S1,S1_max)
-       S1_star_derivatives = SoftArgMax(-alpha_LSE,[S1,S1_max])
-       dS1_star_dS1 = S1_star_derivatives(1)
-   else               ! no smoothing
-       dS1_star_dS1 = 1._rkind  ! S1_star = S1 if no smoothing
-   end if
+     if (smoother) then ! with smooth approximation of min(S1,S1_max)
+         dS1_star_dS1 = SoftArgMax(-alpha_LSE,S1,S1_max)
+     else               ! no smoothing
+         dS1_star_dS1 = 1._rkind  ! S1_star = S1 if no smoothing
+     end if
      dbase_dS1 = -1._rkind/S1_max * dS1_star_dS1
      dInfilArea_dWat(:) = b_arnovic*base**(b_arnovic-1._rkind)*dbase_dS1*dS1_dLiq(:) * dVolFracLiq_dWat(:)     
      dInfilArea_dTk(:)  = b_arnovic*base**(b_arnovic-1._rkind)*dbase_dS1*dS1_dLiq(:) * dVolFracLiq_dTk(:) 
@@ -1210,7 +1250,6 @@ subroutine update_volFracLiq_derivatives
   ! **** Update operations for surfaceFlux: surface runoff from Clark et al. (2008, doi:10.1029/2007WR006735) -- TOPMODEL ****
   ! local variables
   complex(rkind)                   :: F1,F2                              ! temporary storage for regularized lower incomplete gamma function values
-  real(rkind)                      :: dS1_dLiq(1:in_surfaceFlux % nSoil) ! derivative in S1 w.r.t liquid water content 
   real(rkind)                      :: dzeta_crit_n_dS1                   ! derivative of zeta_crit_n w.r.t S1
   real(rkind)                      :: dzeta_crit_dzeta_crit_n            ! derivative of zeta_crit w.r.t zeta_crit_n
   real(rkind)                      :: dx_crit_dzeta_crit                 ! derivative of x_crit w.r.t zeta_crit
@@ -1302,7 +1341,7 @@ subroutine update_volFracLiq_derivatives
      dzeta_crit_dzeta_crit_n = ( n_topmodel*zeta_crit_n**(n_topmodel-1._rkind) ) / zeta_crit_n**n_topmodel
      dx_crit_dzeta_crit = 1._rkind
      dx_crit_dS1 = dx_crit_dzeta_crit * dzeta_crit_dzeta_crit_n * dzeta_crit_n_dS1
-     dgammp_dx_crit = ( (x_crit/chi_topmodel)**(alpha_topmodel-1._rkind) * exp(-x_crit/chi_topmodel) )/chi_topmodel/gamma(alpha_topmodel)
+     dgammp_dx_crit = dgammp_dx(alpha_topmodel,x_crit/chi_topmodel)/chi_topmodel
      dInfilArea_dWat(:) = dgammp_dx_crit * dx_crit_dS1 * dS1_dLiq(:) * dVolFracLiq_dWat(:)     
      dInfilArea_dTk(:)  = dgammp_dx_crit * dx_crit_dS1 * dS1_dLiq(:) * dVolFracLiq_dTk(:)
    endif ! else derivatives are zero
@@ -1559,7 +1598,7 @@ subroutine update_volFracLiq_derivatives
    mLayerDepth      => in_surfaceFlux % mLayerDepth         , & ! depth of each soil layer (m)
    ! input: soil parameters
    theta_sat        => in_surfaceFlux % theta_sat           , & ! soil porosity (-)
-   qSurfScale       => in_surfaceFlux % qSurfScale          , & ! scaling factor in the surface runoff parameterization (-)
+   qSurfScale       => in_surfaceFlux % qSurfScale          , & ! shape of the infiltration area (-)
    ! input-output: surface runoff and infiltration flux (m s-1)
    scalarInfilArea  => io_surfaceFlux % scalarInfilArea       & ! fraction of area where water can infiltrate, may be frozen (-)
   &)
@@ -1595,19 +1634,18 @@ subroutine update_volFracLiq_derivatives
    scalarFrozenArea    => io_surfaceFlux % scalarFrozenArea     & ! fraction of area that is considered impermeable due to soil ice (-)
   &)
    ! define the impermeable area and derivatives due to frozen ground
-   if (rootZoneIce > tiny(rootZoneIce)) then  ! (avoid divide by zero)
-      alpha = 1._rkind/(soilIceCV**2_i4b)     ! shape parameter in the Gamma distribution
-      xLimg = alpha*soilIceScale/rootZoneIce  ! upper limit of the integral
-     !if we use this, we will have a derivative of scalarFrozenArea w.r.t. water and temperature in each layer (through mLayerVolFracIce)
-     ! Should fix to deal with frozen area in the root zone, calculations may be expensive
-     !scalarFrozenArea = 1._rkind - gammp(alpha,xLimg)      ! fraction of frozen area
-     !if(updateInfil)then
-     !  dFrozenArea_dWat(:) = -dgammp_dx(alpha,xLimg)*(-alpha*soilIceScale/rootZoneIce**2_i4b)*dRootZoneIce_dWat(:)
-     !  dFrozenArea_dTk(:)  = -dgammp_dx(alpha,xLimg)*(-alpha*soilIceScale/rootZoneIce**2_i4b)*dRootZoneIce_dTk(:)
-     !end if
-     scalarFrozenArea = 0._rkind
+   if (rootZoneIce > verySmaller) then       ! (avoid divide by zero)
+     alpha = 1._rkind/(soilIceCV**2_i4b)     ! shape parameter in the Gamma distribution
+     xLimg = alpha*soilIceScale/rootZoneIce  ! upper limit of the integral
+     scalarFrozenArea = 1._rkind - gammp(alpha,xLimg) ! fraction of frozen area
+     ! the frozen area depends on the ice in every root layer, so it carries a derivative w.r.t. water and temperature in each of them
+     if(updateInfil)then
+       dFrozenArea_dRootZoneIce = dgammp_dx(alpha,xLimg)*xLimg/rootZoneIce
+       dFrozenArea_dWat(:) = dFrozenArea_dRootZoneIce*dRootZoneIce_dWat(:)
+       dFrozenArea_dTk(:)  = dFrozenArea_dRootZoneIce*dRootZoneIce_dTk(:)
+     end if
    else
-     scalarFrozenArea = 0._rkind
+     scalarFrozenArea = 0._rkind ! derivatives are zero
    end if
   end associate
  end subroutine update_surfaceFlux_liquidFlux_computation_frozen_area
@@ -1616,19 +1654,21 @@ subroutine update_volFracLiq_derivatives
   ! **** Update operations for surfaceFlux: final infiltration calculations ****
   ! local variables
   real(rkind) :: scalarInfilArea_unfrozen ! infiltration area that is not frozen
-  real(rkind) :: rootZoneDepth            ! depth of active root-zone layers used in saturation limiter (m)
-  real(rkind) :: compHeadRootZone         ! mean positive pressure head over active layers (m)
+  real(rkind) :: infilWidth               ! half-width of the smoothing band of the infiltration-rate min (m s-1)
+  real(rkind) :: infilDiff                ! rain plus melt minus the max infiltration rate (m s-1)
+  real(rkind) :: infilExcess              ! smooth positive part of infilDiff, the water input that does not infiltrate (m s-1)
+  real(rkind) :: dExcess_dDiff            ! derivative of infilExcess w.r.t. infilDiff (-)
+  real(rkind) :: dExcess_dWidth           ! derivative of infilExcess w.r.t. infilWidth (-)
+  real(rkind) :: infilRate                ! smoothed min(rain plus melt, max infiltration rate) (m s-1)
+  real(rkind) :: dInfilRate_dMax          ! derivative of infilRate w.r.t. the max infiltration rate (-)
+  real(rkind),parameter :: infilSmoothFrac=0.2_rkind ! half-width of the smoothing band as a fraction of the max infiltration rate (-)
   real(rkind) :: compLimiter              ! smooth limiter that closes infiltration area under strong compression (-)
   real(rkind) :: compLimiter_prev         ! pre-limiter infiltration area used for chain rule (-)
-  real(rkind) :: compArg                  ! argument of logistic compression limiter (-)
-  real(rkind) :: dCompLimiter_dHead       ! derivative of compression limiter w.r.t. mean positive head (m-1)
-  real(rkind),parameter :: compHeadCutoff=1._rkind   ! positive head where compression closure begins (m)
-  real(rkind),parameter :: compHeadWidth =0.02_rkind ! smoothing width for compression closure (m)
+  real(rkind) :: dCompLimiter_dHead       ! derivative of compression limiter w.r.t. mean squared positive head (m-2)
   real(rkind),parameter :: headSmooth =1.e-4_rkind   ! smoothing for max(psi,0) approximation (m)
-  real(rkind) :: posHead(1:in_surfaceFlux % nSoil)   ! smooth positive part of matric head (m)
-  real(rkind) :: dPosHead_dPsi(1:in_surfaceFlux % nSoil) ! derivative of smooth positive head w.r.t. matric head (-)
-  real(rkind) :: dCompHead_dWat(1:in_surfaceFlux % nSoil) ! derivative of mean positive head w.r.t. hyd state (m)
-  integer(i4b) :: ixTop, ixBot             ! top and bottom layer indices for the active root zone
+  real(rkind) :: rootZoneDepth     ! depth of the layers used in the saturation limiter (m)
+  real(rkind) :: meanSqPositiveHead ! depth-weighted mean of squared positive matric head over those layers (m2)
+  integer(i4b) :: ixTop, ixBot     ! top and bottom layer indices used in the saturation limiter
 
   ! compute infiltration
   associate(&
@@ -1662,11 +1702,11 @@ subroutine update_volFracLiq_derivatives
    message => out_surfaceFlux % message  & ! error message
   &)
 
-  ! check infiltration area and define saturated area
+   ! check infiltration area and define saturated area
    if (scalarInfilArea < 0._rkind) then; err=20; message=trim(message)//'infiltration area less than zero'; return_flag=.true.; return; end if
-
+  
    ! Saturation-area limiters
-   if(surfRun_SE==homegrown_SE)then ! infiltration area based on all layers
+   if(surfRun_SE==homegrown_SE)then ! infiltration area based on the root zone below any ice layers
      ixTop = ixIce + 1
      ixBot = nRoots
    else ! if not homegrown_SE, infiltration area based on all layers
@@ -1674,54 +1714,72 @@ subroutine update_volFracLiq_derivatives
      ixBot = nSoil
    end if
 
-  ! Close infiltration under saturation for blocked lower boundaries
-  rootZoneDepth = sum(mLayerDepth(ixTop:ixBot))
-  if (ixTop <= ixBot .and. (bc_lower/=freeDrainage .or. nGlce>0)) then ! glacier always has lower boundary zero flux (blocked boundary)
-    ! drives infiltration area to zero once positive pressure becomes large
-    posHead(:) = 0._rkind
-    dPosHead_dPsi(:) = 0._rkind
-    posHead(ixTop:ixBot) = 0.5_rkind*(mLayerMatricHead(ixTop:ixBot) + sqrt(mLayerMatricHead(ixTop:ixBot)**2_i4b + headSmooth**2_i4b)) ! smooth positive part of matric head (m)
-    dPosHead_dPsi(ixTop:ixBot) = 0.5_rkind*(1._rkind + mLayerMatricHead(ixTop:ixBot)/sqrt(mLayerMatricHead(ixTop:ixBot)**2_i4b + headSmooth**2_i4b))
+   ! Close infiltration under saturation for all lower boundaries: pressure can also build up with free drainage
+   ! (e.g., with ice impedance), and where it does not the limiter stays at one and has no effect.
+   if (ixTop <= ixBot) then
+     ! Reduce infiltration area as positive matric head develops in these layers.
+     rootZoneDepth = sum(mLayerDepth(ixTop:ixBot))
 
-    ! compute derivatives of mean positive head w.r.t. water state variables
-    dCompHead_dWat(:) = 0._rkind
-    compHeadRootZone = sum(posHead(ixTop:ixBot)*mLayerDepth(ixTop:ixBot))/rootZoneDepth
-    compArg = (compHeadRootZone - compHeadCutoff)/compHeadWidth
-    compLimiter = 1._rkind/(1._rkind + exp(2._rkind*compArg))
-    dCompLimiter_dHead = -(2._rkind/compHeadWidth)*compLimiter*(1._rkind - compLimiter)
-    dCompHead_dWat(ixTop:ixBot) = (mLayerDepth(ixTop:ixBot)/rootZoneDepth) * dPosHead_dPsi(ixTop:ixBot)
+     ! Compute the smooth positive part of matric head using the CHKS approximation
+     ! (Kavetski and Kuczera, WRR 2007, Eq. 11), and its derivative.
+     posHead(:)     = 0._rkind
+     dPosHead_dPsi(:) = 0._rkind
+     posHead(ixTop:ixBot)       = 0.5_rkind*(mLayerMatricHead(ixTop:ixBot) + sqrt(mLayerMatricHead(ixTop:ixBot)**2_i4b + headSmooth**2_i4b))
+     dPosHead_dPsi(ixTop:ixBot) = 0.5_rkind*(1._rkind + mLayerMatricHead(ixTop:ixBot)/sqrt(mLayerMatricHead(ixTop:ixBot)**2_i4b + headSmooth**2_i4b))
 
-    ! apply compression limiter to infiltration area and compute derivatives
-    compLimiter_prev = scalarInfilArea
-    scalarInfilArea = scalarInfilArea*compLimiter
-    if(updateInfil)then
-      dInfilArea_dWat(:) = dInfilArea_dWat(:)*compLimiter + compLimiter_prev*dCompLimiter_dHead*dCompHead_dWat(:)
-      dInfilArea_dTk(:)  = dInfilArea_dTk(:)*compLimiter
-    end if
+     ! depth-weighted mean of squared positive head, so each layer has zero slope at its own saturation
+     meanSqPositiveHead = sum(posHead(ixTop:ixBot)**2_i4b*mLayerDepth(ixTop:ixBot))/rootZoneDepth
+
+     ! Reduce infiltration area with a Gaussian in positive head so the limiter does not add a kink to the Jacobian where a layer saturates
+     call compressionLimiter(meanSqPositiveHead,compLimiter,dCompLimiter_dHead)
+
+     ! Derivative of mean squared positive head with respect to water state variables.
+     dCompHead_dWat(:) = 0._rkind
+     dCompHead_dWat(ixTop:ixBot) = (mLayerDepth(ixTop:ixBot)/rootZoneDepth)*2._rkind*posHead(ixTop:ixBot)*dPosHead_dPsi(ixTop:ixBot)
+
+     ! Apply the pressure-dependent infiltration limiter and update derivatives.
+     compLimiter_prev = scalarInfilArea
+     scalarInfilArea  = scalarInfilArea*compLimiter
+     if(updateInfil)then
+       dInfilArea_dWat(:) = dInfilArea_dWat(:)*compLimiter + compLimiter_prev*dCompLimiter_dHead*dCompHead_dWat(:)
+       dInfilArea_dTk(:)  = dInfilArea_dTk(:)*compLimiter
+     end if
    end if
+
    scalarSaturatedArea = 1._rkind - scalarInfilArea
 
    ! unfrozen infiltration area and infiltration (m s-1)
    scalarInfilArea_unfrozen=(1._rkind - scalarFrozenArea)*scalarInfilArea
    scalarSoilControl = 0._rkind
-   scalarSurfaceInfiltration = scalarInfilArea_unfrozen * min(scalarRainPlusMelt,xMaxInfilRate)
+   ! smooth min(rain+melt, max infiltration rate) as r - S(r-x), S a quadratic smooth max(.,0), exact outside the band
+   infilWidth = infilSmoothFrac*xMaxInfilRate
+   infilDiff  = scalarRainPlusMelt - xMaxInfilRate
+   if (infilDiff <= -infilWidth) then      ! rain well below the max rate: all of it infiltrates
+     infilExcess = 0._rkind; dExcess_dDiff = 0._rkind; dExcess_dWidth = 0._rkind
+   else if (infilDiff >= infilWidth) then  ! rain well above the max rate: infiltration at the max rate
+     infilExcess = infilDiff; dExcess_dDiff = 1._rkind; dExcess_dWidth = 0._rkind
+   else                                    ! inside the band
+     infilExcess    = (infilDiff + infilWidth)**2_i4b/(4._rkind*infilWidth)
+     dExcess_dDiff  = (infilDiff + infilWidth)/(2._rkind*infilWidth)
+     dExcess_dWidth = dExcess_dDiff - (infilDiff + infilWidth)**2_i4b/(4._rkind*infilWidth**2_i4b)
+   end if
+   infilRate = scalarRainPlusMelt - infilExcess
+   scalarSurfaceInfiltration = scalarInfilArea_unfrozen * infilRate
 
    ! Compute total runoff derivatives, do w.r.t. infiltration only, scalarRainPlusMelt accounted for in computJacob* module
    if(updateInfil)then
-     if (xMaxInfilRate > scalarRainPlusMelt) then
-       scalarSoilControl = scalarInfilArea_unfrozen  ! derivative dependent on scalarRainPlusMelt (needed to compute scalarRainPlusMelt derivative inside computJacob*)
-     elseif (xMaxInfilRate < scalarRainPlusMelt) then ! dInfilRate_d dependent on layers not at surface
-       dInfilRate_dWat(:) = dxMaxInfilRate_dWat(:)
-       dInfilRate_dTk(:)  = dxMaxInfilRate_dTk(:)
-     end if
+     scalarSoilControl  = scalarInfilArea_unfrozen*(1._rkind - dExcess_dDiff) ! derivative w.r.t. scalarRainPlusMelt (needed inside computJacob*)
+     dInfilRate_dMax    = dExcess_dDiff - infilSmoothFrac*dExcess_dWidth
+     dInfilRate_dWat(:) = dInfilRate_dMax*dxMaxInfilRate_dWat(:)
+     dInfilRate_dTk(:)  = dInfilRate_dMax*dxMaxInfilRate_dTk(:)
      ! Do not need to break into IE and SE components since they are never used separately in the Jacobian assembly
      dq_dHydStateVec(:) = (1._rkind - scalarFrozenArea)&
-                         * ( dInfilArea_dWat(:)*min(scalarRainPlusMelt,xMaxInfilRate) + scalarInfilArea*dInfilRate_dWat(:) )&
-                         + (-dFrozenArea_dWat(:))*scalarInfilArea*min(scalarRainPlusMelt,xMaxInfilRate)
+                         * ( dInfilArea_dWat(:)*infilRate + scalarInfilArea*dInfilRate_dWat(:) )&
+                         + (-dFrozenArea_dWat(:))*scalarInfilArea*infilRate
      ! energy state variable is temperature (transformed outside soilLiqFlux_module if needed)
      dq_dNrgStateVec(:) = (1._rkind - scalarFrozenArea)&
-                         * ( dInfilArea_dTk(:) *min(scalarRainPlusMelt,xMaxInfilRate) + scalarInfilArea*dInfilRate_dTk(:)  )&
-                         + (-dFrozenArea_dTk(:)) *scalarInfilArea*min(scalarRainPlusMelt,xMaxInfilRate)
+                         * ( dInfilArea_dTk(:) *infilRate + scalarInfilArea*dInfilRate_dTk(:)  )&
+                         + (-dFrozenArea_dTk(:)) *scalarInfilArea*infilRate
    end if
   end associate
 
@@ -2112,9 +2170,6 @@ contains
    nodeDepth         => in_qDrainFlux % nodeDepth,            &  ! depth of the lowest soil layer (m)
    ! input: transmittance
    bottomSatHydCond  => in_qDrainFlux % bottomSatHydCond,     &  ! saturated hydraulic conductivity at the bottom of the unsaturated zone (m s-1)
-   ! input: transmittance derivatives
-   dHydCond_dMatric => in_qDrainFlux % dHydCond_dMatric,      &  ! derivative in hydraulic conductivity w.r.t. matric head (s-1)
-   dHydCond_dTemp   => in_qDrainFlux % dHydCond_dTemp,        &  ! derivative in hydraulic conductivity w.r.t temperature (m s-1 K-1)
    ! input: derivatives in soil water characteristic
    node_dPsiLiq_dTemp  => in_qDrainFlux % node_dPsiLiq_dTemp, &  ! derivative in liquid water matric potential w.r.t. temperature (m K-1)
    ! input-output: derivatives
@@ -2135,9 +2190,9 @@ contains
    cflux = -bottomSatHydCond * dPsi/dz
    scalarDrainage = cflux + bottomSatHydCond ! compute the total flux (add gravity flux, positive downwards)
 
-   ! derivatives
-   dq_dHydStateUnsat = -bottomSatHydCond/dz + dHydCond_dMatric
-   dq_dNrgStateUnsat = -bottomSatHydCond*node_dPsiLiq_dTemp/dz + dHydCond_dTemp
+   ! derivatives: the flux is bottomSatHydCond*(nodeMatricHeadLiq/dz + 1) and the conductivity is fixed at saturation
+   dq_dHydStateUnsat = bottomSatHydCond/dz
+   dq_dNrgStateUnsat = bottomSatHydCond*node_dPsiLiq_dTemp/dz
 
    ! Constrain flux: can't drain into glacier and can't exceed melt supply
    scalarSoilControlBot = 0._rkind ! need for derivatives

@@ -1,0 +1,217 @@
+! SUMMA - Structure for Unifying Multiple Modeling Alternatives
+! Copyright (C) 2014-2020 NCAR/RAL; University of Saskatchewan; University of Washington
+!
+! This file is part of SUMMA
+!
+! For more information see: http://www.ral.ucar.edu/projects/summa
+!
+! This program is free software: you can redistribute it and/or modify
+! it under the terms of the GNU General Public License as published by
+! the Free Software Foundation, either version 3 of the License, or
+! (at your option) any later version.
+!
+! This program is distributed in the hope that it will be useful,
+! but WITHOUT ANY WARRANTY; without even the implied warranty of
+! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+! GNU General Public License for more details.
+!
+! You should have received a copy of the GNU General Public License
+! along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+module parameter_overrides_module
+
+USE nr_type, only: i4b,rkind
+USE globalData, only: integerMissing
+
+USE data_types, only: gru_double
+USE data_types, only: gru_hru_dom_doubleVec
+
+implicit none
+private
+
+public :: apply_parameter_overrides
+public :: apply_remainder_override
+public :: split_domain_target
+public :: targets_domain
+
+integer(i4b), parameter, public :: glacierDomains = 100 ! name@glacier: every clean and debris-covered glacier domain
+
+contains
+
+ ! ************************************************************************************************
+ ! public subroutine apply_overrides: apply user-specified parameter values
+ ! ************************************************************************************************
+ subroutine apply_parameter_overrides(nGRU_local,param_name,param_value, &
+                                      mparStruct,bparStruct,err,message)
+ USE get_ixname_module,only:get_ixParam,get_ixBpar           ! access function to find index of elements in structure
+ USE globalData,only:gru_struc                               ! mapping from GRUs to HRUs
+ implicit none
+
+ integer(i4b)            , intent(in)    :: nGRU_local       ! number of GRUs assigned to this rank
+ character(*)            , intent(in)    :: param_name(:)    ! parameter names specified on the command line
+ real(rkind)             , intent(in)    :: param_value(:)   ! parameter values specified on the command line
+ type(gru_hru_dom_doubleVec) , intent(inout) :: mparStruct   ! model parameters for each local HRU and domain
+ type(gru_double)        , intent(inout) :: bparStruct       ! basin parameters for each local GRU
+ integer(i4b)            , intent(out)   :: err              ! error code
+ character(*)            , intent(out)   :: message          ! error message
+ ! local variables
+ integer(i4b)                            :: iParam           ! parameter index in command-line arrays
+ integer(i4b)                            :: ixParam          ! index of parameter in data structure
+ integer(i4b)                            :: iGRU             ! local GRU index
+ integer(i4b)                            :: iHRU             ! local HRU index
+ integer(i4b)                            :: iDOM             ! local domain index
+ character(len=64)                       :: name             ! parameter name without its domain type
+ integer(i4b)                            :: domType          ! domain type the value applies to, 0 for every domain
+
+ ! Start procedure here
+ err=0; message = "apply_parameter_overrides/"
+
+ ! loop through the parameters specified on the command line
+ do iParam=1,size(param_name)
+
+   ! a name@domainType value goes only to the domains of that type
+   call split_domain_target(param_name(iParam),name,domType)
+   if(domType==integerMissing)then
+     message=trim(message)//'unknown domain type in "'//trim(param_name(iParam))//'" (use upland, glacCln1, glacCln2, glacDbr, glacier or wetland)'
+     err=20; return
+   endif
+
+   ! check for a local HRU parameter
+   ixParam=get_ixParam(trim(name))
+   if(ixParam/=integerMissing)then
+
+     ! apply parameter value to every domain of every local HRU, or to those of the named type
+     do iGRU=1,nGRU_local
+       do iHRU=1,gru_struc(iGRU)%hruCount
+         do iDOM=1,gru_struc(iGRU)%hruInfo(iHRU)%domCount
+           if(.not.targets_domain(domType,gru_struc(iGRU)%hruInfo(iHRU)%domInfo(iDOM)%dom_type)) cycle
+           mparStruct%gru(iGRU)%hru(iHRU)%dom(iDOM)%var(ixParam)%dat(:)=param_value(iParam)
+         enddo
+       enddo
+     enddo
+     cycle
+   endif
+
+   ! check for a basin parameter, which has no domains
+   ixParam=get_ixBpar(trim(name))
+   if(ixParam/=integerMissing)then
+     if(domType>0)then
+       message=trim(message)//'basin parameter "'//trim(name)//'" has no domain type to target'
+       err=20; return
+     endif
+
+     ! apply parameter value to all local GRUs
+     do iGRU=1,nGRU_local
+       bparStruct%gru(iGRU)%var(ixParam)=param_value(iParam)
+     enddo
+     cycle
+   endif
+
+   ! parameter name was not recognized
+   message=trim(message)//'unable to identify parameter "'//trim(param_name(iParam))//'"'
+   err=20; return
+ enddo
+
+ end subroutine apply_parameter_overrides
+
+ ! ************************************************************************************************
+ ! public subroutine apply_remainder_override: set a parameter to what its sources leave of a total
+ ! ************************************************************************************************
+ ! in every domain the target selects, as the calibration's remainder dependency sets it (silt = 1 - sand - clay)
+ subroutine apply_remainder_override(nGRU_local,target,sources,total,mparStruct,err,message)
+ USE get_ixname_module,only:get_ixParam                      ! access function to find index of elements in structure
+ USE globalData,only:gru_struc                               ! mapping from GRUs to HRUs
+ implicit none
+ integer(i4b)                , intent(in)    :: nGRU_local   ! number of GRUs assigned to this rank
+ character(*)                , intent(in)    :: target       ! parameter set to the remainder, optionally name@domainType
+ character(*)                , intent(in)    :: sources(:)   ! parameters subtracted from the total
+ real(rkind)                 , intent(in)    :: total        ! total the parameter and its sources add to
+ type(gru_hru_dom_doubleVec) , intent(inout) :: mparStruct   ! model parameters for each local HRU and domain
+ integer(i4b)                , intent(out)   :: err          ! error code
+ character(*)                , intent(out)   :: message      ! error message
+ character(len=64)                           :: name         ! parameter name without its domain type
+ integer(i4b)                                :: domType      ! domain type of the target, 0 for every domain
+ integer(i4b)                                :: ixTarget     ! index of the target parameter
+ integer(i4b)                                :: ixSource(size(sources)) ! index of each source parameter
+ integer(i4b)                                :: iSource,iGRU,iHRU,iDOM,srcType
+ real(rkind)                                 :: tol          ! roundoff below zero that counts as zero
+
+ err=0; message='apply_remainder_override/'
+ call split_domain_target(target,name,domType)
+ ixTarget=get_ixParam(trim(name))
+ if(domType==integerMissing .or. ixTarget==integerMissing)then
+   message=trim(message)//'unable to identify remainder parameter "'//trim(target)//'"'
+   err=20; return
+ endif
+ do iSource=1,size(sources)
+   call split_domain_target(sources(iSource),name,srcType)
+   ixSource(iSource)=get_ixParam(trim(name))
+   if(srcType/=domType .or. ixSource(iSource)==integerMissing)then
+     message=trim(message)//'remainder source "'//trim(sources(iSource))//'" must be a model parameter of the domains of "'//trim(target)//'"'
+     err=20; return
+   endif
+ enddo
+
+ tol=128._rkind*epsilon(1._rkind)*max(1._rkind,abs(total))
+ do iGRU=1,nGRU_local
+   do iHRU=1,gru_struc(iGRU)%hruCount
+     do iDOM=1,gru_struc(iGRU)%hruInfo(iHRU)%domCount
+       if(.not.targets_domain(domType,gru_struc(iGRU)%hruInfo(iHRU)%domInfo(iDOM)%dom_type)) cycle
+       associate(dom=>mparStruct%gru(iGRU)%hru(iHRU)%dom(iDOM))
+         dom%var(ixTarget)%dat(:)=total
+         do iSource=1,size(sources)
+           dom%var(ixTarget)%dat(:)=dom%var(ixTarget)%dat(:)-dom%var(ixSource(iSource))%dat(:)
+         enddo
+         where(dom%var(ixTarget)%dat(:)<0._rkind .and. dom%var(ixTarget)%dat(:)>=-tol) dom%var(ixTarget)%dat(:)=0._rkind
+       end associate
+     enddo
+   enddo
+ enddo
+
+ end subroutine apply_remainder_override
+
+ ! ************************************************************************************************
+ ! public subroutine split_domain_target: split "name@domainType" into the parameter name and the domain type
+ ! ************************************************************************************************
+ ! domType is 0 with no suffix (every domain), and integerMissing for a suffix that names no domain type
+ subroutine split_domain_target(target, name, domType)
+ USE globalData,only:upland,glacCln1,glacCln2,glacDbr,wetland ! horizontal domain types
+ implicit none
+ character(*), intent(in)  :: target   ! parameter name, optionally followed by @ and a domain type
+ character(*), intent(out) :: name     ! parameter name
+ integer(i4b), intent(out) :: domType  ! domain type the value applies to, 0 for every domain
+ integer(i4b)              :: iAt      ! position of the @
+ iAt = index(target,'@')
+ if(iAt==0)then
+   name = trim(target); domType = 0; return
+ endif
+ name = target(1:iAt-1)
+ select case(trim(target(iAt+1:)))
+   case('upland');   domType = upland
+   case('glacCln1'); domType = glacCln1
+   case('glacCln2'); domType = glacCln2
+   case('glacDbr');  domType = glacDbr
+   case('glacier');  domType = glacierDomains
+   case('wetland');  domType = wetland
+   case default;     domType = integerMissing
+ end select
+ end subroutine split_domain_target
+
+ ! ************************************************************************************************
+ ! public function targets_domain: true if a split_domain_target domain type selects a domain of type dom_type
+ ! ************************************************************************************************
+ logical function targets_domain(domType, dom_type)
+ USE globalData,only:glacCln1,glacCln2,glacDbr ! glacier domain types
+ implicit none
+ integer(i4b), intent(in) :: domType  ! domain type from split_domain_target, 0 for every domain
+ integer(i4b), intent(in) :: dom_type ! type of the domain
+ if(domType==0)then
+   targets_domain = .true.
+ elseif(domType==glacierDomains)then
+   targets_domain = dom_type==glacCln1 .or. dom_type==glacCln2 .or. dom_type==glacDbr
+ else
+   targets_domain = dom_type==domType
+ endif
+ end function targets_domain
+
+end module parameter_overrides_module
