@@ -1,0 +1,67 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.env
+
+# Backup and temporary files
+*.before_*
+*.backup*
+*.bak
+*.bak_*
+*~
+.DS_Store
+
+# Slurm and runtime logs
+*.log
+*.out
+*.err
+slurm-*
+logs/
+
+# Generated calibration outputs
+results/
+results_*/
+outputs/
+output/
+production_*/
+pilot_*/
+task_[0-9]*/
+failed_trials/
+scratch/
+
+# Generated model and optimization data
+*.nc
+*.nc4
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+
+# Third-party vendored packages
+vendor/
+
+# Build artifacts
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.mod
+*.so
+
+# FIR-specific experiments (not part of the initial contribution)
+python_wrapper/hybrid_ray_mpi/
+python_wrapper/python_dds_benchmarks/
+python_wrapper/run_ray_async_dds.sh
+python_wrapper/dds_optimiser_step22c_validated.py
+python_wrapper/dds_ray_optimiser.py
+utils/create_lumped_to_hru_mapping.sh
+
+# Site-specific smoke tests and launchers
+python_wrapper/parallel/
+python_wrapper/pymoo_smoke_test.py
+python_wrapper/ray_dds_launcher.py
+python_wrapper/test_single_evaluation.py
