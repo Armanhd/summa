@@ -62,12 +62,6 @@ def main():
             "Evaluation budget must be >= population size"
         )
 
-    if budget % args.population_size != 0:
-        raise ValueError(
-            "For exact CMA-ES generation counting, "
-            "evaluation budget must be divisible by population size"
-        )
-
     if not 0 < args.sigma <= 1:
         raise ValueError("sigma must be within (0, 1]")
 
@@ -148,7 +142,8 @@ def main():
         opened = True
 
         while evaluator.trial_count < budget:
-            population = optimizer.ask()
+            remaining = budget - evaluator.trial_count
+            population = optimizer.ask(number=min(args.population_size, remaining))
             scores = []
 
             for candidate in population:

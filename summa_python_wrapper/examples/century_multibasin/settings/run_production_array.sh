@@ -39,6 +39,9 @@ if [[ "$MODE" == "--run" ]]; then
 
     source "$ROOT/summa_vpr675_python/load_model_env_fir.sh"
     module load scipy-stack/2024b
+    if [[ "$ALGORITHM" == "cmaes" || "$ALGORITHM" == "sceua" ]]; then
+        module load mpi4py/4.0.0
+    fi
 
     SCIPY_STACK=$(python3 -c \
       'import numpy,pathlib; print(pathlib.Path(numpy.__file__).parent.parent)')
