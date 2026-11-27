@@ -61,7 +61,6 @@ python_wrapper/dds_ray_optimiser.py
 utils/create_lumped_to_hru_mapping.sh
 
 # Site-specific smoke tests and launchers
-python_wrapper/parallel/
 python_wrapper/pymoo_smoke_test.py
 python_wrapper/ray_dds_launcher.py
 python_wrapper/test_single_evaluation.py

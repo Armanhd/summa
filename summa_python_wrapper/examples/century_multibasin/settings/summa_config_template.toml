@@ -1,0 +1,201 @@
+# Template file
+
+# Common configuration files are maintained under version control, while
+# basin-specific model inputs are stored separately under the data directory.
+# SUMMA resolves several input files relative to settings_path, so settings_path
+# is set to the user's home directory and those files are specified relative to it.
+
+[simulation]
+
+# case name
+case_name = "{case_name}"
+
+# Directory containing basin-specific model inputs. This directory is relative
+# to settings_path rather than an absolute filesystem path.
+basin_dir = "datasets/nawm/century/domain/{case_name}"
+
+start_time = "1982-10-01 00:00"
+end_time   = "1990-09-30 23:00"
+time_zone  = "localTime"
+
+use_mizuroute    = true
+write_timeseries = false
+
+
+[summa_files]
+
+# SUMMA uses settings_path as the root for both common configuration files
+# and basin-specific settings files. Using the home directory allows both
+# sets of files to be specified relative to a common root.
+settings_path = "{home}/"
+
+# Paths used directly by SUMMA are expanded to complete filesystem paths.
+state_path   = "{home}/{basin_dir}/summa_state/"
+forcing_path = "{home}/{basin_dir}/summa_forcing/"
+output_path  = "{home}/armanhad/hydro_models/experiments/century/MM/{experiment}/work/{case_name}/"
+
+# Basin-specific initial condition file. This is resolved relative to state_path.
+init_condition = "coldState.nc"
+
+# Basin-specific input files. These are resolved relative to settings_path.
+attributes     = "{basin_dir}/summa_inputs/attributes.nc"
+forcing_list   = "{basin_dir}/summa_inputs/forcingFileList.txt"
+trial_params   = "{basin_dir}/summa_inputs/trialParams.nc"
+
+# Common SUMMA configuration files maintained under version control.
+# These are also resolved relative to settings_path.
+decisions        = "armanhad/hydro_models/experiments/century/MM/{experiment}/common_inputs/modelDecisions.txt"
+output_control   = "armanhad/hydro_models/experiments/century/MM/{experiment}/common_inputs/outputControl_short.txt"
+
+local_parameters = "armanhad/hydro_models/experiments/century/MM/{experiment}/common_inputs/localParamInfo.txt"
+basin_parameters = "armanhad/hydro_models/experiments/century/MM/{experiment}/common_inputs/basinParamInfo.txt"
+
+vegetation_table = "armanhad/hydro_models/experiments/century/MM/{experiment}/common_inputs/TBL_VEGPARM.TBL"
+soil_table       = "armanhad/hydro_models/experiments/century/MM/{experiment}/common_inputs/TBL_SOILPARM.TBL"
+general_table    = "armanhad/hydro_models/experiments/century/MM/{experiment}/common_inputs/TBL_GENPARM.TBL"
+noahmp_table     = "armanhad/hydro_models/experiments/century/MM/{experiment}/common_inputs/TBL_MPTABLE.TBL"
+
+
+[mizuRoute]
+
+# Basin-specific mizuRoute inputs.
+namelist_path = "{home}/{basin_dir}/mizuroute_inputs/"
+namelist_file = "mizuroute.param"
+
+methods = "3"
+
+dt = 3600
+
+write_qbasin = true
+write_Qreach = true
+
+
+[hydrofabric]
+
+hfabric_path = "{home}/{basin_dir}/mizuroute_inputs/"
+hfabric_file = "topology.nc"
+
+dname_seg = "seg"
+dname_hru = "hru"
+
+varname_HRUid     = "hruId"
+varname_segId     = "segId"
+varname_hruSegId  = "hruToSegId"
+varname_downSegId = "downSegId"
+
+varname_area   = "area"
+varname_slope  = "slope"
+varname_length = "length"
+
+
+[remapping]
+
+remap_path = "{home}/{basin_dir}/mizuroute_inputs/"
+remap_file = "lumped_to_hru.nc"
+
+dname_hru = "polyid"
+dname_data     = "data"
+
+vname_hruid    = "polyid"
+vname_num_qhru = "nOverlaps"
+vname_weight   = "weight"
+vname_qhruid   = "qhru_id"
+
+
+[observations]
+
+obs_path = "{home}/datasets/nawm/century/observations/obs-daily/"
+obs_file = "{case_name}_daily_flow_observations.nc"
+
+vname_obsflow = "q_obs"
+
+
+[calibration]
+
+algorithm      = "dds"
+
+n_samples      = 5000
+
+start_date     = "1983-10-01"
+end_date       = "1990-09-30"
+
+write_aligned  = true
+
+# Optimization target: ordinary streamflow KGE.
+[[calibration.target]]
+name          = "streamflow_kge"
+variable      = "streamflow"
+obs_path      = "{home}/datasets/nawm/century/observations/obs-daily/"
+obs_file      = "{case_name}_daily_flow_observations.nc"
+vname_obs     = "q_obs"
+metric        = "kge"
+obs_transform = "none"
+weight        = 1.0
+
+# Diagnostic target: NSE of log-transformed flow, excluded from DDS selection.
+[[calibration.target]]
+name          = "streamflow_nse_log"
+variable      = "streamflow"
+obs_path      = "{home}/datasets/nawm/century/observations/obs-daily/"
+obs_file      = "{case_name}_daily_flow_observations.nc"
+vname_obs     = "q_obs"
+metric        = "nse"
+obs_transform = "log"
+weight        = 0.0
+
+# Diagnostic only: NSE on Box-Cox-transformed streamflow, lambda = 0.25.
+[[calibration.target]]
+name          = "streamflow_nse_boxcox_025"
+variable      = "streamflow"
+obs_path      = "{home}/datasets/nawm/century/observations/obs-daily/"
+obs_file      = "{case_name}_daily_flow_observations.nc"
+vname_obs     = "q_obs"
+metric        = "nse"
+obs_transform = "boxcox"
+boxcox_lambda = 0.25
+weight        = 0.0
+
+[calibration.parameters]
+
+frozenPrecipMultip  = { lower = 0.5000,     upper = 2.5000 }
+tempCritRain        = { lower = 270.1600,   upper = 276.1600 }
+Fcapil              = { lower = 0.0100,     upper = 0.1100 }
+summerLAI           = { lower = 0.2000,     upper = 10.0000 }
+windReductionParam  = { lower = 0.0500,     upper = 1.0000 }
+albedoDecayRate     = { lower = 1.0e5,      upper = 5.0e6,   transformation = "log" }
+qSurfScale          = { lower = 1.0000,     upper = 20.0000 }
+k_soil              = { lower = 1.0e-07,    upper = 1.0e-04, transformation = "log" }
+theta_res           = { lower = 0.0010,     upper = 0.1000 }
+theta_sat           = { lower = 0.2000,     upper = 0.7000 }
+critSoilWilting     = { lower = 0.0010,     upper = 0.5000 }
+critSoilTranspire   = { lower = 0.0010,     upper = 0.5000 }
+vGn_n               = { lower = 1.3000,     upper = 4.0000 }
+aquiferBaseflowRate = { lower = 1.0e-07,    upper = 1.0e-05, transformation = "log" }
+aquiferBaseflowExp  = { lower = 1.0000,     upper = 4.0 }
+routingGammaScale   = { lower = 360.0000,   upper = 86400.0000 }
+routingGammaShape   = { lower = 1.0000,     upper = 5.0000 }
+
+[calibration.spatial_multipliers]
+heightCanopyTop     = { lower = 0.5000,     upper = 1.5000 }
+
+[calibration.parameter_ratios]
+
+heightCanopyBottom = { lower = 0.02, upper = 0.1 }
+
+[[parameter_dependencies.parameter_ratio]]
+reference = "heightCanopyTop"
+dependent = "heightCanopyBottom"
+
+# Soil-moisture dependencies
+
+[[parameter_dependencies.ordered]]
+parameters = ["theta_res", "critSoilWilting", "theta_sat"]
+gap_fraction = 0.001
+
+[[parameter_dependencies.ordered]]
+parameters = ["critSoilWilting", "critSoilTranspire", "theta_sat"]
+gap_fraction = 0.025
+
+[[parameter_dependencies.ordered]]
+parameters = ["theta_res", "fieldCapacity", "theta_sat"]
+gap_fraction = 0.025

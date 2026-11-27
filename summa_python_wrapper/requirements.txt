@@ -1,0 +1,7 @@
+numpy
+scipy
+matplotlib
+netCDF4
+pymoo
+spotpy
+cma

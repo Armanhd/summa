@@ -1,0 +1,50 @@
+# CENTURY Python calibration scenarios
+# Preparation only: finalize scenarios before running production.
+# Scientific parameters and objective definitions remain in
+# summa_config_template.toml. No jobs are submitted by this file.
+
+[experiment]
+scenario_id = "GA1"
+name = "exp57"
+production_enabled = true
+
+[dataset]
+root = "/home/armanhad/projects/rrg-mclark/datasets/nawm/century"
+manifest = "settings/manifest.toml"
+expected_basins = 112
+
+[model]
+template = "settings/summa_config_template.toml"
+
+[optimization]
+available_algorithms = ["custom_dds", "spotpy_dds", "sceua", "ga", "de", "cmaes"]
+selected_algorithms = ["ga"]
+evaluations = 5000
+independent_runs = 2
+seed_base = 42
+
+[execution]
+launcher = "mpirun"
+mpi_processes = 1
+cpus_per_task = 1
+memory_gb = 16
+time_limit = "20:00:00"
+max_concurrent_jobs = 12
+use_slurm_tmpdir = true
+
+[restart]
+skip_completed = true
+verify_netcdf = true
+retry_failed = true
+
+[output]
+directory = "results/production"
+save_calibration_netcdf = true
+save_best_parameters_netcdf = true
+
+[ga]
+population_size = 50
+crossover_probability = 0.9
+crossover_eta = 15
+mutation_probability_per_variable = 0.1
+mutation_eta = 20
